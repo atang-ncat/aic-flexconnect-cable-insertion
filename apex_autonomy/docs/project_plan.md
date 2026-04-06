@@ -165,29 +165,29 @@ Ground truth is simply unavailable during evaluation — the organizers control 
 
 ### Active Team Members (5)
 
-| Member | Subteam | Primary Role |
-|--------|---------|-------------|
-| **Andrews** | **Team Alpha** | Lead: data pipeline, infrastructure, ACT training |
-| **Emiralp** | **Team Alpha** | Teleoperation demos (SC port), policy evaluation |
-| **Lahari Sri Kari** | **Team Alpha** | ACT training, hyperparameter tuning, evaluation |
-| **Vijay** | **Team Beta** | Diffusion Policy training, data augmentation, domain randomization |
-| **Devi** | **Team Beta** | Diffusion Policy training, architecture experiments, evaluation |
+| Member | Subteam |
+|--------|:-------:|
+| **Emiralp** | Team Alpha |
+| **Lahari Sri Kari** | Team Alpha |
+| **Andrews** | Team Alpha |
+| **Vijay** | Team Beta |
+| **Devi** | Team Beta |
 
 ### Subteam Responsibilities
 
 #### Team Alpha (3 members) — ACT Route
-- Automated SFP demo collection via CheatCode pipeline
-- SC demo collection via teleoperation (Emiralp)
+- **Data collection path:** Automated SFP demo collection via CheatCode pipeline
 - ACT policy training, evaluation, and iteration
 - Submission packaging (Docker, Lifecycle compliance)
 
 #### Team Beta (2 members) — Diffusion Policy Route
+- **Data collection path:** Teleoperation demos (SC port + supplementary SFP)
 - Diffusion Policy training, evaluation, and iteration
-- Inference speed optimization (DDIM sampling, OneDP distillation)
-- Data augmentation and domain randomization experiments
 
 ### Shared Responsibilities
 - **Dataset is shared** — both teams use the same combined SFP + SC demo dataset
+- **Data augmentation & domain randomization** — both teams contribute (can be applied during training or as a separate dataset expansion step)
+- **Inference speed optimization** — both teams explore techniques (DDIM sampling, OneDP distillation, etc.)
 - **Evaluation protocol is unified** — same 3-trial benchmark for comparing policies
 - **Best-performing policy gets submitted** — healthy competition, best model wins
 - **RL fine-tuning is optional** — either team can explore this once their baseline is working
@@ -201,18 +201,17 @@ Ground truth is simply unavailable during evaluation — the organizers control 
 
 ### Dual-Track Collection Strategy
 
-Data collection is split across both subteams, with datasets merged for all policy training:
+Both teams contribute to data collection, but via **different paths**. Datasets are merged into a single unified training set used by all policies:
 
 ```
 ┌─────────────────────────────────────┐    ┌─────────────────────────────────────┐
-│    TEAM ALPHA: Automated Pipeline   │    │      TEAM BETA: Supplementary       │
+│  TEAM ALPHA: Automated Pipeline     │    │  TEAM BETA: Teleoperation Pipeline  │
 │                                     │    │                                     │
-│  • CheatCode teacher for SFP        │    │  • Teleoperated SFP demos (backup)  │
-│  • Human teleop for SC port         │    │  • Additional approach diversity    │
-│  • Randomized scene configs         │    │  • Manual quality check per demo    │
-│  • Filter by /scoring/insertion_    │    │  • Data augmentation experiments    │
-│    event (auto success detection)   │    │  • Target: 30+ supplementary demos  │
-│  • Target: 100+ SFP, 50+ SC demos  │    │                                     │
+│  • CheatCode teacher for SFP        │    │  • Human teleop for SC port         │
+│  • Randomized scene configs         │    │  • Supplementary SFP teleop demos   │
+│  • Filter by /scoring/insertion_    │    │  • Diverse approach strategies      │
+│    event (auto success detection)   │    │  • Manual quality check per demo    │
+│  • Target: 100+ SFP demos          │    │  • Target: 50+ SC, 30+ SFP demos   │
 └─────────────────┬───────────────────┘    └─────────────────┬───────────────────┘
                   │                                          │
                   └────────────┬─────────────────────────────┘
@@ -251,7 +250,7 @@ Data collection is split across both subteams, with datasets merged for all poli
 - NIC rail translation: -0.0215 – 0.0234m
 - Cable gripper offset Z: ±0.003m (grasp variation)
 
-### SC & Supplementary Demos — Teleoperation (Team Alpha — Emiralp)
+### SC & Supplementary Demos — Teleoperation (Team Beta)
 
 **Method:** Human teleoperation using the provided `aic_teleoperation` tools.
 
@@ -266,9 +265,9 @@ Data collection is split across both subteams, with datasets merged for all poli
 > [!NOTE]
 > `lerobot-record` expects a `PreTrainedPolicy` (neural network). Since CheatCode is a ROS node, we use rosbags + conversion.
 
-### Future: Data Augmentation
+### Data Augmentation (Both Teams)
 
-Once the base dataset is collected, we may explore:
+Once the base dataset is collected, **both teams** will explore augmentation — either applied during training or as a separate dataset expansion step:
 - **Color / brightness jitter** for visual robustness
 - **Random cropping** to simulate camera viewpoint variation
 - **Temporal augmentation** (speed variation) for trajectory diversity
@@ -362,7 +361,7 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
 > [!CAUTION]
 > **This week covers BOTH infrastructure build-out AND full dataset collection.** The two tracks run in parallel to save a full week. By Sunday Apr 13, we need a production-ready dataset.
 
-**Team Alpha — Automated Pipeline + SFP Collection:**
+**Team Alpha — Automated Pipeline (SFP Collection):**
 - [ ] Write `collect_sfp_demos.py` orchestration script:
   - [ ] Randomize scene parameters (board pose, rail translations)
   - [ ] Launch Gazebo programmatically with randomized config
@@ -373,18 +372,18 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
   - [ ] Reset and loop
 - [ ] Write rosbag → LeRobot HDF5 conversion script
 - [ ] Collect **100+ successful SFP demos** with full randomization
-- [ ] Emiralp: Set up teleoperation, collect **50+ SC demos**
 
-**Team Beta — Dataset Support + Training Prep:**
-- [ ] Set up Diffusion Policy training config in LeRobot
-- [ ] Prepare data augmentation pipeline (color jitter, crop, noise)
+**Team Beta — Teleoperation Pipeline (SC + Supplementary SFP):**
+- [ ] Set up teleoperation environment and workflow
+- [ ] Collect **50+ SC insertion demos** via teleoperation
 - [ ] Collect **30+ supplementary SFP demos via teleoperation** (diverse strategies)
-- [ ] Help with rosbag → HDF5 conversion
+- [ ] Set up Diffusion Policy training config in LeRobot
 
 **Shared:**
 - [ ] Merge all demos into **unified dataset** (~180+ demos)
 - [ ] Dataset quality audit: remove corrupted / poor-quality demos
 - [ ] Validate dataset format works with both ACT and Diffusion Policy training
+- [ ] Begin data augmentation pipeline (color jitter, crop, noise) — applied at training time or as dataset expansion
 
 ---
 
@@ -545,7 +544,7 @@ Weeks 5-6 (May 5–14): Phase 5 — Final touches & stability
 
 | Milestone | Target | When | Owner |
 |-----------|--------|------|-------|
-| Data pipeline operational | Auto-collecting SFP demos | Mid-Week 1 | Team Alpha (Andrews) |
+| Data pipeline operational | Auto-collecting SFP demos | Mid-Week 1 | Team Alpha |
 | Full dataset ready | 180+ demos (SFP + SC) | End of Week 1 | Both teams |
 | ACT baseline trained & evaluated | Score > 0 on all 3 trials | Mid-Week 2 | Team Alpha |
 | Diffusion Policy trained & evaluated | Score > 0 on all 3 trials | Mid-Week 2 | Team Beta |
