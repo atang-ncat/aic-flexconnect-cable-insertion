@@ -133,15 +133,19 @@ We will explore **multiple policy architectures** in parallel, leveraging our 5-
 - **Inference speed concern:** Multiple denoising steps can be slow; mitigated by OneDP (single-step distillation) or DDIM sampling with fewer steps
 - **Reference:** Chi et al. 2023, LeRobot has built-in support
 
-#### 3. HIL-SERL — RL Fine-Tuning (Stretch Goal)
+#### 3. RL Fine-Tuning — Optional for Either Team
+
+> [!NOTE]
+> **RL fine-tuning (e.g., HIL-SERL) is an optional stretch goal** that either team can explore for final-stage policy refinement. This is **not** a core deliverable — it's available to whichever team gets their baseline working first and wants to push scores higher.
+
 - **What:** Human-in-the-loop sample-efficient RL that fine-tunes a policy with online interventions
-- **Strengths:** Achieves >95% success on insertion tasks within 1–2.5 hours of training, can refine IL policies beyond demonstration quality
-- **When to use:** After ACT or Diffusion Policy reaches ~80%+ success — HIL-SERL can push to near-perfect by RL fine-tuning with human corrections
-- **Data needs:** Pre-trained IL policy + ~1–2 hrs of online interaction with human corrections
+- **Strengths:** Achieves >95% success on insertion tasks within 1–2.5 hours of training
+- **When to use:** After ACT or Diffusion Policy reaches ~80%+ success rate
+- **Compute:** ✅ We have the GPU compute to handle RL training. **We do NOT need Isaac Lab to parallelize training** — our hardware is sufficient for the RL loop in Gazebo directly.
 - **Reference:** Luo et al. 2024, `rail-berkeley/hil-serl`
 
 > [!TIP]
-> **Our recommended progression:** Train ACT + Diffusion Policy in parallel → pick best performer → optionally fine-tune with HIL-SERL for the final push to >95% success rate.
+> **Our recommended progression:** Train ACT + Diffusion Policy in parallel → pick best performer → optionally fine-tune with RL for the final push to >95% success rate.
 
 ### Is Using CheatCode Demos Legal?
 
@@ -163,29 +167,33 @@ Ground truth is simply unavailable during evaluation — the organizers control 
 
 | Member | Subteam | Primary Role |
 |--------|---------|-------------|
-| **Andrews** | Team Alpha | Lead: CheatCode automation, data pipeline, infrastructure |
-| **Lahari Sri Kari** | Team Alpha | ACT training, hyperparameter tuning, evaluation |
-| **Vijay** | Team Alpha | ACT training, data augmentation, domain randomization |
-| **Devi** | Team Beta | Diffusion Policy training, architecture experiments |
-| **Emiralp** | Team Beta | Teleoperation demos (SC port), Diffusion Policy evaluation |
+| **Andrews** | **Team Alpha** | Lead: data pipeline, infrastructure, ACT training |
+| **Emiralp** | **Team Alpha** | Teleoperation demos (SC port), policy evaluation |
+| **Lahari Sri Kari** | **Team Alpha** | ACT training, hyperparameter tuning, evaluation |
+| **Vijay** | **Team Beta** | Diffusion Policy training, data augmentation, domain randomization |
+| **Devi** | **Team Beta** | Diffusion Policy training, architecture experiments, evaluation |
 
 ### Subteam Responsibilities
 
 #### Team Alpha (3 members) — ACT Route
 - Automated SFP demo collection via CheatCode pipeline
+- SC demo collection via teleoperation (Emiralp)
 - ACT policy training, evaluation, and iteration
 - Submission packaging (Docker, Lifecycle compliance)
 
 #### Team Beta (2 members) — Diffusion Policy Route
-- SC demo collection via teleoperation
 - Diffusion Policy training, evaluation, and iteration
 - Inference speed optimization (DDIM sampling, OneDP distillation)
+- Data augmentation and domain randomization experiments
 
 ### Shared Responsibilities
 - **Dataset is shared** — both teams use the same combined SFP + SC demo dataset
 - **Evaluation protocol is unified** — same 3-trial benchmark for comparing policies
 - **Best-performing policy gets submitted** — healthy competition, best model wins
-- If time permits, explore **HIL-SERL fine-tuning** on the best-performing policy
+- **RL fine-tuning is optional** — either team can explore this once their baseline is working
+
+> [!NOTE]
+> **On RL fine-tuning:** We have the compute resources to handle RL training workloads. There is **no need for Isaac Lab** or parallel simulation environments — we can run the RL fine-tuning loop directly in Gazebo on our hardware. This is a bonus optimization, not a dependency.
 
 ---
 
@@ -197,13 +205,14 @@ Data collection is split across both subteams, with datasets merged for all poli
 
 ```
 ┌─────────────────────────────────────┐    ┌─────────────────────────────────────┐
-│    TEAM ALPHA: Automated Pipeline   │    │      TEAM BETA: Teleoperation       │
+│    TEAM ALPHA: Automated Pipeline   │    │      TEAM BETA: Supplementary       │
 │                                     │    │                                     │
-│  • CheatCode teacher for SFP        │    │  • Human teleop for SC port         │
-│  • Randomized scene configs         │    │  • Human teleop for SFP (backup)    │
-│  • Filter by /scoring/insertion_    │    │  • Manual quality check per demo    │
-│    event (auto success detection)   │    │  • Diverse approach strategies      │
-│  • Target: 100+ SFP demos          │    │  • Target: 50+ SC, 30+ SFP demos   │
+│  • CheatCode teacher for SFP        │    │  • Teleoperated SFP demos (backup)  │
+│  • Human teleop for SC port         │    │  • Additional approach diversity    │
+│  • Randomized scene configs         │    │  • Manual quality check per demo    │
+│  • Filter by /scoring/insertion_    │    │  • Data augmentation experiments    │
+│    event (auto success detection)   │    │  • Target: 30+ supplementary demos  │
+│  • Target: 100+ SFP, 50+ SC demos  │    │                                     │
 └─────────────────┬───────────────────┘    └─────────────────┬───────────────────┘
                   │                                          │
                   └────────────┬─────────────────────────────┘
@@ -220,8 +229,8 @@ Data collection is split across both subteams, with datasets merged for all poli
               ┌─────────────┼─────────────────┐
               ▼             ▼                 ▼
          ┌────────┐   ┌──────────────┐  ┌──────────┐
-         │  ACT   │   │  Diffusion   │  │ HIL-SERL │
-         │ Policy │   │   Policy     │  │ (later)  │
+         │  ACT   │   │  Diffusion   │  │ RL Tuning│
+         │ Policy │   │   Policy     │  │(optional)│
          └────────┘   └──────────────┘  └──────────┘
 ```
 
@@ -242,7 +251,7 @@ Data collection is split across both subteams, with datasets merged for all poli
 - NIC rail translation: -0.0215 – 0.0234m
 - Cable gripper offset Z: ±0.003m (grasp variation)
 
-### SC & Supplementary Demos — Teleoperation (Team Beta)
+### SC & Supplementary Demos — Teleoperation (Team Alpha — Emiralp)
 
 **Method:** Human teleoperation using the provided `aic_teleoperation` tools.
 
@@ -271,8 +280,8 @@ Once the base dataset is collected, we may explore:
 
 ### Policy Architecture Comparison
 
-| Feature | ACT | Diffusion Policy | HIL-SERL |
-|---------|-----|-----------------|----------|
+| Feature | ACT | Diffusion Policy | RL Fine-Tuning (Optional) |
+|---------|-----|-----------------|------------|
 | **Type** | Imitation Learning | Imitation Learning | RL (fine-tuning) |
 | **Action representation** | Chunk of K future actions | Denoised action sequence | Single-step policy |
 | **Multimodal handling** | VAE latent space | Naturally multimodal (diffusion process) | Standard policy gradient |
@@ -303,7 +312,40 @@ After training, evaluate in Gazebo with `ground_truth:=false`:
 
 ---
 
-## 6. Task Breakdown
+## 6. Submission Strategy
+
+### Multi-Submission Approach
+
+We are targeting **4 total submissions** leading up to the deadline, ensuring progressive improvement with feedback from the evaluation system.
+
+> [!IMPORTANT]
+> **Key assumption:** The competition portal allows multiple submissions per day, and each submission returns scores that help us gauge improvement. If this is not the case, we need to verify with the organizers immediately and adjust our strategy.
+
+| Submission | Target Date | Goal | Expected State |
+|:----------:|:-----------:|------|----------------|
+| **#1 — Baseline** | **Apr 20** (end of Week 2) | First working policy that can perform insertion | Baseline ACT or Diffusion Policy; scores > 0 on all trials |
+| **#2 — Improved** | **Apr 27** (end of April) | Refined policy after one week of iteration | Higher success rate, better scores from targeted fixes |
+| **#3 — Competitive** | **May 4** (first week of May) | Polished policy with optimizations | Strong insertion rates, Tier 2 optimizations started |
+| **#4 — Final** | **May 12–14** (before deadline) | Best possible policy with all refinements | Maximum scores, RL fine-tuning if applicable |
+
+> [!TIP]
+> Each submission gives us score feedback. Use this feedback loop to prioritize what to fix next — don't guess, measure.
+
+### Submission Feedback Loop
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────────┐     ┌──────────┐
+│  Train   │ ──► │  Submit  │ ──► │  Get Scores  │ ──► │ Analyze  │
+│  Policy  │     │  Docker  │     │  Per Trial   │     │ Failures │
+└──────────┘     └──────────┘     └──────────────┘     └────┬─────┘
+     ▲                                                      │
+     └──────────────────────────────────────────────────────┘
+                    Iterate & Improve
+```
+
+---
+
+## 7. Task Breakdown
 
 ### Phase 0: Environment Setup ✅ DONE
 - [x] Get Gazebo eval container running in distrobox
@@ -315,9 +357,12 @@ After training, evaluate in Gazebo with `ground_truth:=false`:
 
 ---
 
-### Phase 1: Data Collection Infrastructure (Week 1)
+### Phase 1: Data Infrastructure + Full Dataset Curation — Week 1 (Apr 7–13)
 
-**Team Alpha — Automated Pipeline:**
+> [!CAUTION]
+> **This week covers BOTH infrastructure build-out AND full dataset collection.** The two tracks run in parallel to save a full week. By Sunday Apr 13, we need a production-ready dataset.
+
+**Team Alpha — Automated Pipeline + SFP Collection:**
 - [ ] Write `collect_sfp_demos.py` orchestration script:
   - [ ] Randomize scene parameters (board pose, rail translations)
   - [ ] Launch Gazebo programmatically with randomized config
@@ -327,87 +372,117 @@ After training, evaluate in Gazebo with `ground_truth:=false`:
   - [ ] Save successful bags, discard failures
   - [ ] Reset and loop
 - [ ] Write rosbag → LeRobot HDF5 conversion script
-- [ ] Collect first batch of **50 successful SFP demos**
+- [ ] Collect **100+ successful SFP demos** with full randomization
+- [ ] Emiralp: Set up teleoperation, collect **50+ SC demos**
 
-**Team Beta — Teleoperation Setup:**
-- [ ] Set up teleoperation environment
-- [ ] Practice SC insertion manually (5–10 warmup runs)
-- [ ] Document teleoperation workflow for the team
-- [ ] Collect first batch of **20 SC demos**
-
----
-
-### Phase 2: Full Dataset Collection (Week 2)
-
-**Team Alpha:**
-- [ ] Scale SFP collection to **100+ successful demos**
-- [ ] Validate dataset: spot-check 10 demos visually
-- [ ] Begin ACT training on SFP-only dataset (early results)
-
-**Team Beta:**
-- [ ] Collect **50+ SC insertion demos**
+**Team Beta — Dataset Support + Training Prep:**
+- [ ] Set up Diffusion Policy training config in LeRobot
+- [ ] Prepare data augmentation pipeline (color jitter, crop, noise)
 - [ ] Collect **30+ supplementary SFP demos via teleoperation** (diverse strategies)
-- [ ] Convert all demos to HDF5 format
+- [ ] Help with rosbag → HDF5 conversion
 
 **Shared:**
 - [ ] Merge all demos into **unified dataset** (~180+ demos)
 - [ ] Dataset quality audit: remove corrupted / poor-quality demos
+- [ ] Validate dataset format works with both ACT and Diffusion Policy training
 
 ---
 
-### Phase 3: Parallel Policy Training (Week 3)
+### Phase 2: ACT vs Diffusion Policy — Parallel Training — Week 2 (Apr 14–20)
+
+> [!IMPORTANT]
+> **Both teams train in parallel on the same shared dataset.** By the close of this week, we should have **baseline policies that can perform the insertion task.** This is also our **Submission #1** deadline.
 
 **Team Alpha — ACT:**
 - [ ] Train ACT on combined SFP + SC dataset with task conditioning
 - [ ] Evaluate on all 3 trial types
 - [ ] Record baseline scores
-- [ ] Identify failure modes
+- [ ] Identify failure modes (which trial fails, why)
 
 **Team Beta — Diffusion Policy:**
-- [ ] Configure Diffusion Policy training in LeRobot
-- [ ] Train on same combined dataset
+- [ ] Train Diffusion Policy on same combined dataset
 - [ ] Evaluate on all 3 trial types
 - [ ] Compare scores vs ACT
+- [ ] Optimize inference speed if needed (DDIM, fewer steps)
 
 **Shared:**
 - [ ] **Policy comparison meeting**: which performs better on which trials?
-- [ ] Decide whether both tracks continue or one is prioritized
+- [ ] Package best-performing policy into Docker
+- [ ] 🚀 **SUBMISSION #1** — Baseline policy (target: Apr 20)
 
 ---
 
-### Phase 4: Iteration & Hardening (Weeks 4–5)
+### Phase 3: Iteration, Efficiency & Optimization — Week 3 (Apr 21–27)
 
+> [!IMPORTANT]
+> **Focus: make it better.** Use the scores from Submission #1 to drive targeted improvements.
+
+- [ ] Analyze Submission #1 scores per trial — identify weakest points
 - [ ] Collect more targeted demos for failure cases
 - [ ] Hyperparameter tuning (chunk size, learning rate, augmentation, denoising steps)
 - [ ] Increase domain randomization coverage
 - [ ] Stress test across 20+ randomized configs
-- [ ] **Optional:** HIL-SERL fine-tuning on best-performing policy
-- [ ] **Target: ≥75 pts on Trials 1 & 2, ≥50 pts on Trial 3**
-
----
-
-### Phase 5: Docker & Submission (Week 5)
-
-- [ ] Package best policy into Docker following `submission.md`
-- [ ] Verify ROS 2 Lifecycle compliance:
-  - `unconfigured` → `configured` → `active` → `deactivate` → `cleanup` → `shutdown`
-- [ ] Test full local evaluation mimicking cloud pipeline
-- [ ] Confirm policy handles all 3 trials end-to-end
-- [ ] Submit to evaluation portal
-- [ ] Iterate based on leaderboard results
-
----
-
-### Phase 6: Polish & Buffer (Week 6)
-
-- [ ] Optimize Tier 2 scores (smoothness, speed, efficiency)
+- [ ] Optimize Tier 2 scores (smoothness, speed, trajectory efficiency)
 - [ ] Fine-tune force control to avoid penalties
-- [ ] Second submission attempt if time permits
-- [ ] Final submission before May 15 deadline
+- [ ] **Optional (either team):** Begin RL fine-tuning exploration on best-performing policy
+- [ ] 🚀 **SUBMISSION #2** — Improved policy (target: Apr 27, end of month)
 
 ---
 
-## 7. Why End-to-End Wins for This Task
+### Phase 4: Competitive Polish — Week 4 (Apr 28–May 4)
+
+- [ ] Continue iteration based on Submission #2 feedback
+- [ ] Push insertion success rate higher on all 3 trials
+- [ ] Ensure no collisions (−24 pts) or excessive force (−12 pts)
+- [ ] **Optional (either team):** RL fine-tuning if baseline is at ~80%+ success
+- [ ] Test submission Docker in full local evaluation (mimicking cloud pipeline)
+- [ ] 🚀 **SUBMISSION #3** — Competitive policy (target: May 4, first week of May)
+
+---
+
+### Phase 5: Final Touches — Weeks 5–6 (May 5–14)
+
+> [!CAUTION]
+> **Do NOT introduce major changes this late.** Focus on stability, edge cases, and Tier 2 score optimization.
+
+- [ ] Analyze Submission #3 scores — close remaining gaps
+- [ ] Final hyperparameter sweep (small adjustments only)
+- [ ] Verify ROS 2 Lifecycle compliance is rock-solid:
+  - `unconfigured` → `configured` → `active` → `deactivate` → `cleanup` → `shutdown`
+- [ ] Run 50+ randomized evaluation trials locally — confirm consistency
+- [ ] 🚀 **SUBMISSION #4 — FINAL** (target: May 12–14, before May 15 deadline)
+
+---
+
+## 8. RL Fine-Tuning — Optional Track
+
+> [!NOTE]
+> **This section is for either team.** RL fine-tuning is entirely optional and should only be pursued once a team has a working baseline policy with reasonable success rates (~80%+).
+
+### When to Consider RL
+
+| Condition | Action |
+|-----------|--------|
+| Baseline policy < 50% success | ❌ Don't bother with RL — fix data & architecture first |
+| Baseline policy 50–80% success | ⚠️ Maybe — focus on more demos and tuning first |
+| Baseline policy > 80% success | ✅ RL fine-tuning can push to 95%+ |
+
+### Compute & Infrastructure
+
+- ✅ **We have the GPU compute** to run RL training workloads
+- ✅ **No need for Isaac Lab** to parallelize training — our hardware handles the RL loop directly in Gazebo
+- ✅ **HIL-SERL** is designed for sample-efficient fine-tuning (1–2 hours of online interaction)
+
+### Approach
+
+1. Take the best-performing IL policy (ACT or Diffusion Policy)
+2. Use HIL-SERL for online fine-tuning with human corrections
+3. Focus on the specific trial types where the IL policy struggles
+4. Validate improvement on the full 3-trial benchmark before submitting
+
+---
+
+## 9. Why End-to-End Wins for This Task
 
 Traditional modular approaches to robot manipulation build separate components:
 
@@ -427,7 +502,7 @@ Each module introduces failure points, requires hand-tuned interfaces, and canno
 
 ---
 
-## 8. Risk Mitigation
+## 10. Risk Mitigation
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
@@ -436,36 +511,56 @@ Each module introduces failure points, requires hand-tuned interfaces, and canno
 | ACT doesn't generalize | Low eval scores | Diffusion Policy as backup; different inductive bias may work better |
 | Diffusion Policy too slow | Can't run at real-time | DDIM with fewer steps, or OneDP distillation |
 | Grasp variation breaks insertion | Failed trials at eval | Add ±2mm gripper offset perturbations to demos |
-| Submission Docker doesn't build | Can't submit | Start Docker packaging in Phase 5, not last minute |
+| Submission Docker doesn't build | Can't submit | Test submission pipeline starting Week 2, not last minute |
 | Proximity-only scores too low | Fail to qualify | Even 25 pts/trial × 3 = 75 pts; enough to qualify |
 | One subteam's policy clearly better | Wasted effort | Not wasted — second policy provides fallback and comparison data |
+| Competition doesn't allow multiple daily submissions | Can't iterate fast | Verify submission rules early; adjust cadence accordingly |
 
 ---
 
-## 9. Timeline Summary
+## 11. Execution Timeline Summary
 
 ```
-Week 1 (Apr 7–13):   Phase 1 — Data infrastructure + first demos (both teams)
-Week 2 (Apr 14–20):  Phase 2 — Full dataset + early ACT training
-Week 3 (Apr 21–27):  Phase 3 — Parallel training (ACT vs Diffusion Policy)
-Week 4 (Apr 28–May 4): Phase 4a — Iterate, collect more demos, compare policies
-Week 5 (May 5–11):   Phase 4b + 5 — Docker + local testing + first submission
-Week 6 (May 12–15):  Phase 6 — Polish + final submission
+TODAY: April 6, 2026 (Sunday)
+
+Week 1 (Apr 7–13):   Phase 1 — Data infrastructure + full dataset curation (COMBINED)
+Week 2 (Apr 14–20):  Phase 2 — ACT vs Diffusion Policy parallel training
+                      ┗━━ 🚀 SUBMISSION #1 — Baseline policies (Apr 20)
+Week 3 (Apr 21–27):  Phase 3 — Iteration, efficiency, optimization
+                      ┗━━ 🚀 SUBMISSION #2 — Improved policy (Apr 27)
+Week 4 (Apr 28–May 4): Phase 4 — Competitive polish
+                      ┗━━ 🚀 SUBMISSION #3 — Competitive policy (May 4)
+Weeks 5-6 (May 5–14): Phase 5 — Final touches & stability
+                      ┗━━ 🚀 SUBMISSION #4 — FINAL (May 12–14)
+
+                      ━━━ QUALIFICATION DEADLINE: MAY 15 ━━━
 ```
 
 > [!CAUTION]
-> **Do NOT leave submission packaging to the last week.** Docker/container bugs are the #1 reason teams fail competitions.
+> **Submission #1 at end of Week 2 is non-negotiable.** Having a baseline that scores > 0 proves the full pipeline (data → train → Docker → submit → score) works end-to-end. Everything after that is improvement.
 
 ---
 
-## 10. Success Criteria
+## 12. Success Criteria
 
 | Milestone | Target | When | Owner |
 |-----------|--------|------|-------|
-| SFP auto-collection working | 100+ successful bags | End of Week 2 | Team Alpha |
-| SC demos collected | 50+ demos | End of Week 2 | Team Beta |
-| ACT model evaluated | Score > 0 on all 3 trials | End of Week 3 | Team Alpha |
-| Diffusion Policy evaluated | Score > 0 on all 3 trials | End of Week 3 | Team Beta |
-| Best policy selected | ≥75 pts on Trials 1 & 2 | End of Week 4 | Both |
-| Submission working | Docker passes local eval | End of Week 5 | Andrews |
+| Data pipeline operational | Auto-collecting SFP demos | Mid-Week 1 | Team Alpha (Andrews) |
+| Full dataset ready | 180+ demos (SFP + SC) | End of Week 1 | Both teams |
+| ACT baseline trained & evaluated | Score > 0 on all 3 trials | Mid-Week 2 | Team Alpha |
+| Diffusion Policy trained & evaluated | Score > 0 on all 3 trials | Mid-Week 2 | Team Beta |
+| **Submission #1** | **Baseline policy submitted** | **Apr 20** | **Both** |
+| **Submission #2** | **Improved policy, higher scores** | **Apr 27** | **Both** |
+| **Submission #3** | **Competitive policy** | **May 4** | **Both** |
+| **Submission #4 — FINAL** | **Best possible policy** | **May 12–14** | **All** |
 | **Qualification** | **≥ 150 pts total** | **May 15** | **All** |
+
+---
+
+## 13. Open Questions
+
+> [!WARNING]
+> **Verify these with the competition organizers ASAP:**
+> 1. **Does the competition allow multiple submissions per day?** Our strategy assumes we can submit frequently and iterate on scores.
+> 2. **Do we receive per-trial scores after each submission?** We need this feedback to know which trials are failing and prioritize fixes.
+> 3. **Is there a cooldown between submissions?** If so, we need to be more strategic about when we submit.
