@@ -254,7 +254,9 @@ Both teams contribute to data collection, but via **different paths**. Datasets 
 
 **Method:** Human teleoperation using the provided `aic_teleoperation` tools.
 
-**Why manual for SC:** Our testing confirmed CheatCode's PI controller cannot handle SC port insertion due to oscillation and lack of physical self-correction.
+**Why manual for SC:** Our testing confirmed CheatCode's I-only lateral controller (no proportional term) cannot handle SC port insertion — the integrator either can't correct enough (7.5mm max vs 8-20mm error) or overshoots and oscillates when gains are increased. See `docs/sc_insertion_problem.md` for the full technical analysis.
+
+**Hybrid approach (recommended):** Use CheatCode to automate the **approach phase** (getting the connector close to the SC port), then switch to human teleoperation for the **final alignment + insertion**. This eliminates the slow manual approach phase and speeds up SC data collection.
 
 **Additional value:** Teleoperated demos capture diverse approach strategies (different paths, speeds, corrections) that automated demos can't provide. This diversity improves policy generalization.
 
