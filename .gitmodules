@@ -1,0 +1,3 @@
+[submodule "src/aic"]
+	path = src/aic
+	url = https://github.com/intrinsic-dev/aic.git

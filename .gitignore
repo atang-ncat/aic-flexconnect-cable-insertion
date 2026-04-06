@@ -1,0 +1,31 @@
+# Pixi environment (12GB+)
+src/aic/.pixi/
+
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rosbags (too large for git)
+*.db3
+*.mcap
+
+# Temp files
+*.swp
+*.swo
+*~
