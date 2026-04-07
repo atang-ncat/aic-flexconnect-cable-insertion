@@ -199,80 +199,135 @@ Ground truth is simply unavailable during evaluation — the organizers control 
 
 ## 4. Data Collection Plan
 
+### Critical Constraint: Action Space Mismatch
+
+> [!CAUTION]
+> **CheatCode and the training pipeline use DIFFERENT action spaces.** You cannot simply record CheatCode's output as training data.
+>
+> | Component | Action Mode | Action Format |
+> |-----------|------------|---------------|
+> | **CheatCode** → `set_pose_target()` | `MODE_POSITION` | Target Pose (position + orientation) |
+> | **RunACT** → `set_cartesian_twist_target()` | `MODE_VELOCITY` | 6D Cartesian Twist (linear.xyz + angular.xyz) |
+> | **lerobot-record** / `AICRobotAICController` | `MODE_VELOCITY` | 6D Cartesian Twist |
+>
+> If you record CheatCode's position commands and train a policy on them, at inference time RunACT would interpret the outputs as velocities. **The robot would do something completely wrong.**
+
+### What's Ready to Use Today
+
+| Tool | Status | Purpose |
+|------|:------:|---------|
+| `lerobot-record` | ✅ Ready | Records teleop demos in native LeRobot format (keyboard/spacemouse) |
+| `lerobot-train` | ✅ Ready | Trains ACT / Diffusion Policy from LeRobot datasets |
+| `grkw/aic_act_policy` | ✅ Ready | Pre-trained ACT baseline on HuggingFace — free insurance |
+| `lerobot-teleoperate` | ✅ Ready | Practice teleop before recording |
+| CheatCode (fixed) | ✅ Works for SFP+SC | But outputs position actions — **incompatible with training format** |
+
+### What Does NOT Exist Yet
+
+- ❌ No CheatCode velocity-mode wrapper/recorder
+- ❌ No batch/randomized scene launcher script
+- ❌ No rosbag-to-LeRobot conversion script
+- ❌ No committed datasets
+
 ### Dual-Track Collection Strategy
 
-Both teams contribute to data collection, but via **different paths**. Datasets are merged into a single unified training set used by all policies:
-
 ```
-┌─────────────────────────────────────┐    ┌─────────────────────────────────────┐
-│  TEAM ALPHA: Automated Pipeline     │    │  TEAM BETA: Teleoperation Pipeline  │
-│                                     │    │                                     │
-│  • CheatCode teacher for SFP        │    │  • Human teleop for SC port         │
-│  • Randomized scene configs         │    │  • Supplementary SFP teleop demos   │
-│  • Filter by /scoring/insertion_    │    │  • Diverse approach strategies      │
-│    event (auto success detection)   │    │  • Manual quality check per demo    │
-│  • Target: 100+ SFP demos          │    │  • Target: 50+ SC, 30+ SFP demos   │
-└─────────────────┬───────────────────┘    └─────────────────┬───────────────────┘
-                  │                                          │
-                  └────────────┬─────────────────────────────┘
-                               ▼
-                 ┌─────────────────────────────┐
-                 │   UNIFIED TRAINING DATASET  │
-                 │                             │
-                 │  ~180+ demos total          │
-                 │  Both SFP and SC            │
-                 │  Diverse randomization      │
-                 │  LeRobot HDF5 format        │
-                 └──────────┬──────────────────┘
-                            │
-              ┌─────────────┼─────────────────┐
-              ▼             ▼                 ▼
-         ┌────────┐   ┌──────────────┐  ┌──────────┐
-         │  ACT   │   │  Diffusion   │  │ RL Tuning│
-         │ Policy │   │   Policy     │  │(optional)│
-         └────────┘   └──────────────┘  └──────────┘
+┌──────────────────────────────────────────┐  ┌──────────────────────────────────────────┐
+│ TRACK A: Manual Teleop via lerobot-record│  │ TRACK B: CheatCode Velocity Wrapper      │
+│ (PRIMARY — works TODAY)                  │  │ (PARALLEL — needs engineering)            │
+│                                          │  │                                          │
+│ • Keyboard/spacemouse teleop             │  │ • CheatCode computes target pose         │
+│ • Correct velocity action format         │  │ • Wrapper converts to velocity commands  │
+│ • All 5 team members can contribute      │  │ • Records via AICRobotAICController      │
+│ • Diverse approaches + recovery behavior │  │ • Filter by /scoring/insertion_event     │
+│ • ~30-40 demos/hour per operator         │  │ • Scalable to hundreds of demos          │
+│ • Target: 50+ SFP, 50+ SC demos         │  │ • Target: 100+ automated demos           │
+└────────────────────┬─────────────────────┘  └────────────────────┬─────────────────────┘
+                     │                                             │
+                     └─────────────────┬───────────────────────────┘
+                                       ▼
+                         ┌───────────────────────────┐
+                         │  UNIFIED TRAINING DATASET  │
+                         │  LeRobot HDF5 format       │
+                         │  6D velocity actions       │
+                         │  ~200+ demos total         │
+                         └─────────┬─────────────────┘
+                                   │
+                     ┌─────────────┼─────────────────┐
+                     ▼             ▼                 ▼
+                ┌────────┐   ┌──────────────┐  ┌──────────┐
+                │  ACT   │   │  Diffusion   │  │ RL Tuning│
+                │ Policy │   │   Policy     │  │(optional)│
+                └────────┘   └──────────────┘  └──────────┘
 ```
 
-### SFP Demos — Automated via CheatCode (Team Alpha)
+### Track A: Manual Teleop via lerobot-record (Primary — All Team Members)
 
-**Method:** Run CheatCode across randomized NIC card configurations. Filter by `/scoring/insertion_event` topic (binary ground-truth oracle).
+**This is the primary data source. It works today and produces correctly formatted data.**
+
+```bash
+cd ~/ws_aic/src/aic
+pixi run lerobot-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_keyboard_ee --teleop.id=aic \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --dataset.repo_id=${HF_USER}/aic_sfp_demos \
+  --dataset.single_task="insert sfp module into nic card port" \
+  --dataset.push_to_hub=false --display_data=true --play_sounds=false
+```
+
+**Key guidelines:**
+- Rotate scene configs between sessions (vary board pose, rail translations)
+- Each demo takes ~60-90 seconds including reset
+- Record diverse approaches: fast/slow, different angles, include recovery moments
+- **Imperfect demos are valuable** — slight wobbles and corrections teach the policy to recover
+- All 5 team members can contribute immediately
+
+### Track B: CheatCode Velocity Wrapper (Parallel — 1-2 engineers)
+
+**Engineering task:** Write a script that uses CheatCode's `calc_gripper_pose` logic to compute target poses, then converts to velocity commands compatible with the LeRobot pipeline.
+
+The core conversion:
+```python
+# CheatCode computes a target pose
+target_pose = calc_gripper_pose(port_transform, z_offset=z_offset)
+
+# Convert position target to velocity command
+current_pose = observation["tcp_pose"]
+linear_vel = K_p * (target_position - current_position)
+angular_vel = K_r * orientation_error(target_orientation, current_orientation)
+
+# Record as 6D velocity action (compatible with LeRobot)
+action = [linear_vel.x, linear_vel.y, linear_vel.z,
+          angular_vel.x, angular_vel.y, angular_vel.z]
+```
 
 **Automation loop:**
-1. Launch Gazebo with randomized board pose / NIC rail translation
-2. Start rosbag recording (cameras + joints + F/T + actions)
-3. Run CheatCode via `InsertCable` action goal
-4. Monitor `/scoring/insertion_event` — if received, keep bag; else discard
-5. Reset simulation, repeat with new randomization
+1. Launch Gazebo with randomized config
+2. Connect via `AICRobotAICController.get_observation()` and `send_action()`
+3. Run CheatCode velocity logic, recording each `(observation, action)` pair
+4. Monitor `/scoring/insertion_event` for success filtering
+5. Save successful episodes as LeRobot dataset
+6. Reset and repeat
 
-**Randomization ranges:**
-- Board X: 0.12 – 0.20m, Y: -0.25 – 0.05m
-- Board yaw: 2.8 – 3.5 rad
-- NIC rail translation: -0.0215 – 0.0234m
-- Cable gripper offset Z: ±0.003m (grasp variation)
+### Why Teleop Demos Are Better Than CheatCode-Only
 
-### SC & Supplementary Demos — Teleoperation (Team Beta)
-
-**Method:** Human teleoperation using the provided `aic_teleoperation` tools.
-
-**Why manual for SC:** Our testing confirmed CheatCode's I-only lateral controller (no proportional term) cannot handle SC port insertion — the integrator either can't correct enough (7.5mm max vs 8-20mm error) or overshoots and oscillates when gains are increased. See `docs/sc_insertion_problem.md` for the full technical analysis.
-
-**Hybrid approach (recommended):** Use CheatCode to automate the **approach phase** (getting the connector close to the SC port), then switch to human teleoperation for the **final alignment + insertion**. This eliminates the slow manual approach phase and speeds up SC data collection.
-
-**Additional value:** Teleoperated demos capture diverse approach strategies (different paths, speeds, corrections) that automated demos can't provide. This diversity improves policy generalization.
-
-### Data Format & Conversion
-
-**Primary path:** Record rosbags → convert to LeRobot HDF5 format via custom script.
-
-> [!NOTE]
-> `lerobot-record` expects a `PreTrainedPolicy` (neural network). Since CheatCode is a ROS node, we use rosbags + conversion.
+| What teleop provides | What CheatCode-only would lack |
+|---------------------|-------------------------------|
+| **Diverse approach paths** | Same mathematical trajectory every time |
+| **Recovery behaviors** | Never encounters or recovers from misalignment |
+| **Force-aware insertion** | Ignores F/T sensor entirely |
+| **Broad state distribution** | Narrow — always visits same states |
+| **Natural speed variation** | Fixed 10mm/s descent |
 
 ### Data Augmentation (Both Teams)
 
-Once the base dataset is collected, **both teams** will explore augmentation — either applied during training or as a separate dataset expansion step:
+Once the base dataset is collected:
 - **Color / brightness jitter** for visual robustness
 - **Random cropping** to simulate camera viewpoint variation
 - **Temporal augmentation** (speed variation) for trajectory diversity
+- **Synthetic noise injection** on F/T readings
+
 - **Synthetic noise injection** on F/T readings
 
 ---
@@ -353,39 +408,44 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
 - [x] Run CheatCode for successful SFP insertion
 - [x] Confirm `/scoring/insertion_event` topic is available
 - [x] Set up git repo and push to GitHub
-- [x] Verify CheatCode behavior across different port types (SFP ✅, SC ❌)
+- [x] Verify CheatCode behavior across different port types (SFP ✅, SC ✅ after fix)
 - [x] Add orientation-aware CheatCode patch for reference
+- [x] Fix CheatCode kinematic targeting bug (plug-to-gripper offset)
 
 ---
 
-### Phase 1: Data Infrastructure + Full Dataset Curation — Week 1 (Apr 7–13)
+### Phase 1: Pipeline Validation + Data Collection — Week 1 (Apr 7–13)
 
 > [!CAUTION]
-> **This week covers BOTH infrastructure build-out AND full dataset collection.** The two tracks run in parallel to save a full week. By Sunday Apr 13, we need a production-ready dataset.
+> **Day 1 is critical.** Validate the full end-to-end pipeline (record → train → deploy) BEFORE investing in bulk data collection. The most dangerous mistake is spending all week building infrastructure and ending up with zero trained policies.
 
-**Team Alpha — Automated Pipeline (SFP Collection):**
-- [ ] Write `collect_sfp_demos.py` orchestration script:
-  - [ ] Randomize scene parameters (board pose, rail translations)
-  - [ ] Launch Gazebo programmatically with randomized config
-  - [ ] Start rosbag recording
-  - [ ] Trigger CheatCode (lifecycle + action goal)
-  - [ ] Monitor `/scoring/insertion_event` for success
-  - [ ] Save successful bags, discard failures
-  - [ ] Reset and loop
-- [ ] Write rosbag → LeRobot HDF5 conversion script
-- [ ] Collect **100+ successful SFP demos** with full randomization
+**Day 1 — Pipeline Validation (Both Teams):**
+- [ ] Test pre-trained `grkw/aic_act_policy` baseline on all 3 trial types (free scores!)
+- [ ] Test `lerobot-record` end-to-end with keyboard teleop (3-5 throwaway demos)
+- [ ] Verify dataset saves correctly and can be loaded for training
+- [ ] Test `lerobot-teleoperate` for practice
 
-**Team Beta — Teleoperation Pipeline (SC + Supplementary SFP):**
-- [ ] Set up teleoperation environment and workflow
-- [ ] Collect **50+ SC insertion demos** via teleoperation
-- [ ] Collect **30+ supplementary SFP demos via teleoperation** (diverse strategies)
-- [ ] Set up Diffusion Policy training config in LeRobot
+**Days 2-7 — Parallel Data Collection:**
+
+**Track A — Manual Teleop (All Team Members, PRIMARY):**
+- [ ] Record **50+ SFP insertion demos** via `lerobot-record`
+- [ ] Record **50+ SC insertion demos** via `lerobot-record`
+- [ ] Rotate scene configs between sessions (vary board pose, rail translations)
+- [ ] Include diverse approaches: fast/slow, different angles, recovery moments
+
+**Track B — CheatCode Velocity Wrapper (1-2 engineers, PARALLEL):**
+- [ ] Write `cheatcode_velocity_wrapper.py`:
+  - [ ] Use CheatCode's `calc_gripper_pose` to compute target poses
+  - [ ] Convert position targets to 6D velocity commands
+  - [ ] Record via `AICRobotAICController.get_observation()` + `send_action()`
+  - [ ] Monitor `/scoring/insertion_event` for success filtering
+  - [ ] Save as LeRobot dataset format
+- [ ] Collect **100+ automated demos** with randomization (SFP + SC)
 
 **Shared:**
-- [ ] Merge all demos into **unified dataset** (~180+ demos)
+- [ ] Merge Track A + Track B demos into **unified dataset** (~200+ demos)
 - [ ] Dataset quality audit: remove corrupted / poor-quality demos
 - [ ] Validate dataset format works with both ACT and Diffusion Policy training
-- [ ] Begin data augmentation pipeline (color jitter, crop, noise) — applied at training time or as dataset expansion
 
 ---
 
