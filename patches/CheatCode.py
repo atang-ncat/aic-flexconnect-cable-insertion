@@ -153,9 +153,8 @@ class CheatCode(Policy):
         lateral_u = R_port[:, 0]       # port local X
         lateral_v = R_port[:, 1]       # port local Y
 
-        # Plug-to-gripper offset projected onto the insertion axis
+        # Plug-to-gripper offset (we need this to command the gripper to place the plug)
         plug_to_gripper = gripper_pos - plug_pos
-        insertion_offset = float(np.dot(plug_to_gripper, insertion_axis))
 
         # Lateral errors in the port's local frame
         error_vec = port_pos - plug_pos
@@ -182,16 +181,20 @@ class CheatCode(Policy):
         )
 
         i_gain = 0.15
+        p_gain = 0.05  # Added proportional gain for immediate correction
 
-        # Generalized target: port position + insertion offset + lateral corrections
-        target = (
+        # We want the plug tip to reach this ideal position:
+        target_plug_pos = (
             port_pos
-            + insertion_axis * (z_offset - insertion_offset)
-            + lateral_u * i_gain * self._tip_x_error_integrator
-            + lateral_v * i_gain * self._tip_y_error_integrator
+            + insertion_axis * z_offset
+            + lateral_u * (p_gain * u_error + i_gain * self._tip_x_error_integrator)
+            + lateral_v * (p_gain * v_error + i_gain * self._tip_y_error_integrator)
         )
 
-        blend = position_fraction * target + (1.0 - position_fraction) * gripper_pos
+        # To place the plug at target_plug_pos, the gripper must be offset appropriately
+        target_gripper_pos = target_plug_pos + plug_to_gripper
+
+        blend = position_fraction * target_gripper_pos + (1.0 - position_fraction) * gripper_pos
 
         return Pose(
             position=Point(
