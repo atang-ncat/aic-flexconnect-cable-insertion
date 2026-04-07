@@ -34,13 +34,33 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
   sc_mount_rail_0_present:=true sc_mount_rail_0_translation:=-0.09
 ```
 
-**Terminal 3 — Start teleoperation:**
+**Terminal 2 — Start lerobot-record (records data + gives you keyboard teleop):**
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic/
+export UV_CACHE_DIR=/tmp/uv-cache-atang
+export RATTLER_CACHE_DIR=/tmp/rattler-cache-atang
+export XDG_CACHE_HOME=/tmp/cache-atang
+pixi run lerobot-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_keyboard_ee --teleop.id=aic \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --dataset.repo_id=atang/aic_sfp_demos \
+  --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
+  --dataset.push_to_hub=false \
+  --dataset.private=true \
+  --play_sounds=false \
+  --display_data=true
+```
+
+> **Tip:** Add the three `export` lines to your `~/.bashrc` so you don't have to type them every session.
+
+**Terminal 2 (alternative) — Standalone teleop for practice (no recording):**
 ```bash
 source ~/lab/ws_aic/setup_dev.sh
 ros2 run aic_teleoperation cartesian_keyboard_teleop
 ```
 
-**Terminal 4 (optional) — Monitor insertion success:**
+**Terminal 3 (optional) — Monitor insertion success:**
 ```bash
 ros2 topic echo /scoring/insertion_event
 ```
@@ -355,12 +375,142 @@ yaw:=2.9                               # more rotated
 
 ---
 
-## 12. Next Steps After Practice
+## 12. Recording with lerobot-record — Full Workflow
 
-Once you are comfortable with teleoperation (can reliably insert SFP in <15 seconds and SC in <25 seconds):
+### How it works
 
-1. **Set up recording** — either via `lerobot-record` (if pixi works) or a custom rosbag recording script
-2. **Collect SFP demos** — target 50+ episodes across varied scene configs
-3. **Collect SC demos** — target 50+ episodes across varied scene configs
-4. **Train your policy** — use `lerobot-train` with the ACT architecture
-5. **Evaluate** — run the trained policy without ground truth and check scores
+`lerobot-record` does two things simultaneously:
+1. **Gives you keyboard teleop** (same keys as `cartesian_keyboard_teleop`)
+2. **Records everything** — joint states, actions, and all 3 camera feeds at 30 fps
+
+The Gazebo scene runs separately in its own terminal. `lerobot-record` connects to the running ROS 2 system by subscribing to `/observations`, camera topics, etc.
+
+### Episode management hotkeys
+
+| Key | Action |
+|-----|--------|
+| **Right Arrow** | **Save** the current episode and start recording the next one |
+| **Left Arrow** | **Discard** the current episode (use during the "Reset" phase after a bad demo) |
+| **Ctrl+C** | **Stop** recording entirely and exit. The dataset is saved automatically. |
+
+### Step-by-step recording workflow
+
+1. **Launch Gazebo** in terminal 1 with your scene configuration
+2. **Launch lerobot-record** in terminal 2 (see command in Section 1)
+3. You will see `Recording episode 0` — start teleoperating immediately
+4. After a successful insertion, press **Right Arrow** to save the episode
+5. During the "Reset" phase (encoding video, ~10–20 seconds), you can:
+   - Kill Gazebo in terminal 1 and relaunch with a new scene configuration
+   - Wait for `Recording episode N` to appear before teleoperating again
+6. If the demo was bad (wrong port, wild movements), press **Left Arrow** to discard
+7. Repeat steps 3–6 for each episode
+8. When done collecting, press **Ctrl+C** to stop
+
+### Timing: don't let episodes time out
+
+Episodes auto-save after 60 seconds (`episode_time_s: 60`). If you don't press Right Arrow within 60 seconds, the episode saves automatically — including all the idle time at the end. This pads your data with useless zero-velocity frames.
+
+**Always press Right Arrow** as soon as the insertion succeeds (or as soon as you decide the attempt is done). A good SFP demo is 10–20 seconds, not 60.
+
+### Where is the dataset saved?
+
+The dataset is saved locally to:
+
+```
+~/.cache/huggingface/lerobot/atang/aic_sfp_demos/
+```
+
+(Or if you set `XDG_CACHE_HOME`, it's under `$XDG_CACHE_HOME/huggingface/lerobot/atang/aic_sfp_demos/`.)
+
+The directory structure:
+
+```
+atang/aic_sfp_demos/
+├── meta/
+│   ├── info.json          # dataset metadata (fps, features, etc.)
+│   ├── episodes.jsonl     # per-episode metadata
+│   └── tasks.jsonl        # task description
+├── data/
+│   └── train-00000-of-00001.parquet   # numerical data (joints, actions)
+└── videos/
+    ├── observation.images.left_camera/
+    │   ├── episode_000000.mp4
+    │   ├── episode_000001.mp4
+    │   └── ...
+    ├── observation.images.center_camera/
+    │   └── ...
+    └── observation.images.right_camera/
+        └── ...
+```
+
+### Resuming a previous session
+
+To add more episodes to an existing dataset, add `--resume=true`:
+
+```bash
+pixi run lerobot-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_keyboard_ee --teleop.id=aic \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --dataset.repo_id=atang/aic_sfp_demos \
+  --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
+  --dataset.push_to_hub=false \
+  --dataset.private=true \
+  --play_sounds=false \
+  --display_data=true \
+  --resume=true
+```
+
+This picks up from the last episode number instead of starting over.
+
+### The Rerun viewer window
+
+When `--display_data=true`, a Rerun visualization window pops up showing:
+- **Time-series plots** of all joint states, velocities, and action commands
+- **Live camera feeds** from all three cameras
+- **Timeline strip** of recorded frames
+
+This is purely a monitoring tool — it does NOT control the robot. It is useful for verifying that all cameras are capturing and that action data looks reasonable. You can safely minimize it while teleoperating, or pass `--display_data=false` to disable it entirely.
+
+---
+
+## 13. Collecting a Full Dataset — Practical Checklist
+
+### SFP dataset (Trials 1 and 2)
+
+| Step | Details |
+|------|---------|
+| **Target** | 50+ episodes |
+| **repo_id** | `atang/aic_sfp_demos` |
+| **task** | `"Insert SFP connector into SFP port on NIC card"` |
+| **Scene variation** | Rotate through 3–4 different `nic_card_mount_0_translation` values and 2–3 `yaw` values |
+| **Episode length** | Aim for 10–20 seconds per episode |
+
+### SC dataset (Trial 3)
+
+| Step | Details |
+|------|---------|
+| **Target** | 50+ episodes |
+| **repo_id** | `atang/aic_sc_demos` |
+| **task** | `"Insert SC plug into SC port"` |
+| **cable_type** | `sfp_sc_cable_reversed` |
+| **Scene variation** | Rotate through `sc_port_0_translation` and `yaw` values |
+| **Episode length** | Aim for 15–30 seconds per episode (SC is harder) |
+
+### Session rhythm
+
+1. Pick a scene configuration, launch Gazebo
+2. Record 5–8 episodes with that configuration
+3. Kill Gazebo, change the configuration, relaunch
+4. Repeat until you have 50+ good episodes
+5. Take a 5-minute break every 20 minutes
+
+---
+
+## 14. Next Steps After Collection
+
+Once you have 50+ SFP and 50+ SC demos:
+
+1. **Train your policy** — use `lerobot-train` with the ACT architecture
+2. **Evaluate** — run the trained policy without ground truth and check scores
+3. **Iterate** — identify failure modes, collect targeted demos for weak areas, retrain
