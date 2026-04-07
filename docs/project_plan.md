@@ -320,14 +320,126 @@ action = [linear_vel.x, linear_vel.y, linear_vel.z,
 | **Broad state distribution** | Narrow — always visits same states |
 | **Natural speed variation** | Fixed 10mm/s descent |
 
+### Teleoperation Guide — How to Record High-Quality Demos
+
+> [!TIP]
+> **Read this before touching the keyboard.** The quality of your demos directly determines the quality of your policy. A dataset of 50 excellent demos will outperform 200 sloppy ones.
+
+#### Setup
+
+```bash
+# Terminal 1: Launch Gazebo with ground truth enabled (for scoring feedback)
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true \
+  cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005
+
+# Terminal 2: Practice teleop BEFORE recording
+cd ~/ws_aic/src/aic
+pixi run lerobot-teleoperate \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_keyboard_ee --teleop.id=aic \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --display_data=true
+
+# Terminal 3: Monitor insertion success
+ros2 topic echo /scoring/insertion_event
+```
+
+#### Keyboard Controls (Cartesian mode, `base_link` frame)
+
+| Key | Motion | Think of it as... |
+|-----|--------|-------------------|
+| `a` / `d` | -X / +X (left / right) | Sliding the arm left-right |
+| `w` / `s` | -Y / +Y (forward / back) | Pushing arm forward or pulling back |
+| `r` / `f` | -Z / +Z (up / down) | **This is your insertion axis** — `f` pushes DOWN into the port |
+| `q` / `e` | -Yaw / +Yaw | Rotating the connector clockwise/counter-clockwise |
+| `Shift+w` / `Shift+s` | +Roll / -Roll | Tilting the connector forward/back |
+| `Shift+a` / `Shift+d` | -Pitch / +Pitch | Tilting the connector left/right |
+| `t` | Toggle slow/fast mode | **Start in slow mode. Always.** |
+
+> [!IMPORTANT]
+> **Shift+key release order matters:** Let go of the letter key BEFORE releasing Shift. Otherwise the robot keeps rotating after you release both keys.
+
+#### Recording Controls (during `lerobot-record`)
+
+| Key | Function |
+|-----|----------|
+| Right Arrow | Finish current episode, start next |
+| Left Arrow | Discard current episode, re-record |
+| ESC | Stop recording session |
+
+#### The 5 Phases of a Good Demo
+
+**Phase 1: Orient (1-2 seconds).** Before moving, look at the camera feeds (`--display_data=true`). Identify the target port. For SFP, find the green NIC card. For SC, find the blue box.
+
+**Phase 2: Coarse approach (3-5 seconds).** Use `a`/`d` and `w`/`s` to slide the arm laterally until the connector is roughly above the target port. Use fast mode (`t`) for this. Do NOT descend yet.
+
+**Phase 3: Fine alignment (3-5 seconds).** Switch to slow mode (`t`). Use small taps on `a`/`d`/`w`/`s` to center the connector precisely over the port opening. Watch the center camera feed — the connector tip should be directly above the port center.
+
+**Phase 4: Insertion (3-5 seconds).** Press `f` (descend) in slow mode. Use short, gentle taps. Watch the force readings if visible. If you feel resistance (the connector stops moving down), STOP. Nudge laterally with `a`/`d`/`w`/`s` to realign, then continue descending.
+
+**Phase 5: Confirmation (1-2 seconds).** Hold position briefly. Check terminal 3 for `/scoring/insertion_event`. If it fires, press Right Arrow to save. If not, try gentle adjustments or press Left Arrow to discard and retry.
+
+#### Golden Rules for Demo Quality
+
+1. **Slow is fast.** Gentle, deliberate movements produce better training signal than fast, jerky ones. The policy learns your speed profile — if you rush, it rushes.
+
+2. **Include corrections.** If you overshoot, correct it visibly. Do NOT discard the demo. The policy needs to learn what "being slightly wrong and fixing it" looks like. These recovery moments are the most valuable training data.
+
+3. **Vary your approach.** Do not always follow the exact same path. Sometimes approach from the left, sometimes from the right. Sometimes go slow, sometimes slightly faster. This diversity is what makes the policy robust.
+
+4. **One thing at a time.** Move in one axis at a time. Don't press `d` and `f` simultaneously. Sequential movements are easier for the policy to learn than diagonal ones.
+
+5. **Start every demo from the same initial state** (reset the sim between episodes). But vary the scene config across recording sessions.
+
+6. **Record 5 practice demos first and discard them.** Your first few will be terrible. That's normal. Get comfortable with the controls before recording for real.
+
+7. **Take breaks.** Fatigue kills demo quality. Record in 20-minute sessions with 5-minute breaks.
+
+### Alternative Data Collection — What If We Had No CheatCode and No Teleop?
+
+> [!NOTE]
+> This section discusses hypothetical alternatives. We have both CheatCode and teleop available — these are fallback ideas or supplementary strategies worth knowing about.
+
+Even without a ground-truth teacher policy or human teleop, there are several creative approaches to collecting training demonstrations:
+
+#### 1. Scripted Trajectory Generation
+Write a simple Python script that generates smooth waypoint trajectories toward the port based on the `Task` message fields. At training time, use ground-truth TF frames to compute the target position. Generate trajectories as sequences of velocity commands:
+
+```python
+# Compute a straight-line velocity trajectory from current TCP to target
+direction = normalize(target_pos - current_tcp_pos)
+velocity = direction * speed  # constant speed along the line
+```
+
+Unlike CheatCode, this would output velocity actions (compatible with training). The trajectories would be geometrically simple (straight lines or splines) but still provide useful approach demonstrations. This is essentially a "dumb CheatCode" that does not need a PI controller.
+
+#### 2. DAgger with the Pre-Trained Baseline
+Run the pre-trained `grkw/aic_act_policy` in the sim. When it succeeds, keep the episode. When it fails, record the failure trajectory anyway (the approach portion is still useful), and optionally have a human correct the final alignment via teleop. This is a form of Dataset Aggregation (DAgger) — using the current policy to generate data, then augmenting with corrections.
+
+#### 3. Replay-Based Data Collection (Isaac Lab Path)
+The workspace includes Isaac Lab demo recording and replay scripts at `src/aic/aic_utils/aic_isaac/aic_isaaclab/scripts/record_demos.py`. Isaac Lab supports massive parallelization (hundreds of environments simultaneously), randomization events, and HDF5 output. If you train an RL policy in Isaac Lab first (even a rough one), you can record its rollouts as demonstrations, then convert to LeRobot format for ACT training. This is a "sim-to-sim" transfer approach.
+
+#### 4. Inverse Kinematics Trajectory Sampling
+Using the known port position (from ground-truth TF at training time) and the robot's URDF, compute IK solutions for a sequence of waypoints along the insertion path. Sample multiple approach angles and speeds. Convert joint trajectories to Cartesian velocities via the Jacobian. This produces diverse, physically valid demonstrations without any controller or human input.
+
+#### 5. Motion Planning + Noise Injection
+Use a standard motion planner (MoveIt, OMPL) to generate collision-free paths from the starting configuration to the port. Add Gaussian noise to the planned trajectories to create diversity. Record the noisy trajectories as demonstrations. The noise teaches the policy to handle imperfect states.
+
+#### 6. Cross-Simulator Transfer
+Train a basic policy in MuJoCo (which has a mirror environment at `src/aic/aic_utils/aic_mujoco/`) where physics may differ. Record successful trajectories. Use these as demonstrations for Gazebo training. The physics mismatch acts as implicit domain randomization.
+
+The key insight across all these approaches: **you do not need a human to demonstrate the task if you have ground-truth state at training time.** Any method that can generate trajectories ending with the plug in the port produces valid training data — the learned policy will then reproduce these trajectories using only camera observations.
+
 ### Data Augmentation (Both Teams)
 
 Once the base dataset is collected:
 - **Color / brightness jitter** for visual robustness
 - **Random cropping** to simulate camera viewpoint variation
 - **Temporal augmentation** (speed variation) for trajectory diversity
-- **Synthetic noise injection** on F/T readings
-
 - **Synthetic noise injection** on F/T readings
 
 ---
@@ -351,7 +463,7 @@ Once the base dataset is collected:
 |-----------|-----|-----------------|
 | Framework | LeRobot | LeRobot |
 | Chunk size | 100 | 16–32 |
-| Image resolution | 480×640 (3 cameras) | 480×640 (3 cameras) |
+| Image resolution | 288x256 (3 cameras, 0.25x scale) | 288x256 (3 cameras, 0.25x scale) |
 | Learning rate | 1e-5 | 1e-4 |
 | Batch size | 8–16 | 8–16 |
 | Training steps | 100K–300K | 100K–300K |
@@ -606,15 +718,18 @@ Weeks 5-6 (May 5–14): Phase 5 — Final touches & stability
 
 | Milestone | Target | When | Owner |
 |-----------|--------|------|-------|
-| Data pipeline operational | Auto-collecting SFP demos | Mid-Week 1 | Team Alpha |
-| Full dataset ready | 180+ demos (SFP + SC) | End of Week 1 | Both teams |
+| Pre-trained baseline tested | `grkw/aic_act_policy` scores on all 3 trials known | Day 1 (Apr 7) | Both teams |
+| `lerobot-record` pipeline validated | Record, save, and load a demo end-to-end | Day 1 (Apr 7) | Both teams |
+| Manual teleop demos flowing | 20+ SFP + 20+ SC demos recorded | Mid-Week 1 | Both teams |
+| CheatCode velocity wrapper operational | Automated demo collection running | Mid-Week 1 | 1-2 engineers |
+| Full dataset ready | 200+ demos (SFP + SC, merged) | End of Week 1 | Both teams |
 | ACT baseline trained & evaluated | Score > 0 on all 3 trials | Mid-Week 2 | Team Alpha |
 | Diffusion Policy trained & evaluated | Score > 0 on all 3 trials | Mid-Week 2 | Team Beta |
 | **Submission #1** | **Baseline policy submitted** | **Apr 20** | **Both** |
 | **Submission #2** | **Improved policy, higher scores** | **Apr 27** | **Both** |
 | **Submission #3** | **Competitive policy** | **May 4** | **Both** |
-| **Submission #4 — FINAL** | **Best possible policy** | **May 12–14** | **All** |
-| **Qualification** | **≥ 150 pts total** | **May 15** | **All** |
+| **Submission #4 -- FINAL** | **Best possible policy** | **May 12-14** | **All** |
+| **Qualification** | **>= 150 pts total** | **May 15** | **All** |
 
 ---
 
