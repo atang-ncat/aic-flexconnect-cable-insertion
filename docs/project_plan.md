@@ -491,7 +491,7 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
 
 | Submission | Target Date | Goal | Expected State |
 |:----------:|:-----------:|------|----------------|
-| **#1 — Baseline** | **Apr 20** (end of Week 2) | First working policy that can perform insertion | Baseline ACT or Diffusion Policy; scores > 0 on all trials |
+| **#1 — Baseline** | **Apr 22** (mid of Week 3) | First working policy that can perform insertion | Baseline ACT or Diffusion Policy; scores > 0 on all trials |
 | **#2 — Improved** | **Apr 27** (end of April) | Refined policy after one week of iteration | Higher success rate, better scores from targeted fixes |
 | **#3 — Competitive** | **May 4** (first week of May) | Polished policy with optimizations | Strong insertion rates, Tier 2 optimizations started |
 | **#4 — Final** | **May 12–14** (before deadline) | Best possible policy with all refinements | Maximum scores, RL fine-tuning if applicable |
@@ -526,7 +526,7 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
 
 ---
 
-### Phase 1: Pipeline Validation + Data Collection — Week 1 (Apr 7–13)
+### Phase 1: Pipeline Validation + Data Collection — Week 1 (Apr 7–16)
 
 > [!CAUTION]
 > **Day 1 is critical.** Validate the full end-to-end pipeline (record → train → deploy) BEFORE investing in bulk data collection. The most dangerous mistake is spending all week building infrastructure and ending up with zero trained policies.
@@ -561,7 +561,7 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
 
 ---
 
-### Phase 2: ACT vs Diffusion Policy — Parallel Training — Week 2 (Apr 14–20)
+### Phase 2: ACT vs Diffusion Policy — Parallel Training — Week 2 (Apr 17–22)
 
 > [!IMPORTANT]
 > **Both teams train in parallel on the same shared dataset.** By the close of this week, we should have **baseline policies that can perform the insertion task.** This is also our **Submission #1** deadline.
@@ -585,7 +585,7 @@ We are targeting **4 total submissions** leading up to the deadline, ensuring pr
 
 ---
 
-### Phase 3: Iteration, Efficiency & Optimization — Week 3 (Apr 21–27)
+### Phase 3: Iteration, Efficiency & Optimization — Week 3 (Apr 22–27)
 
 > [!IMPORTANT]
 > **Focus: make it better.** Use the scores from Submission #1 to drive targeted improvements.
