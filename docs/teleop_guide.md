@@ -47,12 +47,13 @@ pixi run lerobot-record \
   --dataset.push_to_hub=false \
   --dataset.private=true \
   --play_sounds=false \
-  --display_data=true
+  --display_data=true \
+  --resume=true
 ```
 
 > **Note:** The `UV_CACHE_DIR`, `RATTLER_CACHE_DIR`, and `XDG_CACHE_HOME` environment variables are already set in `~/.bashrc`, so you don't need to export them manually.
 
-> **If you've already recorded episodes:** This command only works the very first time (to create a new dataset). On subsequent sessions, you **must** add `--resume=true` or you will get a `FileExistsError` crash. See [Resuming a previous session](#resuming-a-previous-session) below.
+> **First time only:** If you have never recorded any episodes yet (the dataset directory does not exist), remove `--resume=true` from the command above. It will create a fresh dataset. Every session after that, keep `--resume=true` to continue adding episodes — without it, lerobot crashes with `FileExistsError`.
 
 **Terminal 2 (alternative) — Standalone teleop for practice (no recording):**
 ```bash
@@ -445,25 +446,9 @@ atang/aic_sfp_demos/
 
 ### Resuming a previous session
 
-> **Important:** If you have already recorded episodes and want to add more, you **must** pass `--resume=true`. Without it, lerobot tries to create the dataset directory from scratch and **crashes** with `FileExistsError` because the directory already exists.
+The main recording command in Section 1 already includes `--resume=true`. Just copy-paste it and you'll pick up from the last episode number. This is the normal workflow — you launch Gazebo, run the command, record a few episodes, Ctrl+C, and come back later to record more.
 
-```bash
-cd /run/host/scratch2/atang/ws_aic/src/aic/
-pixi run lerobot-record \
-  --robot.type=aic_controller --robot.id=aic \
-  --teleop.type=aic_keyboard_ee --teleop.id=aic \
-  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
-  --dataset.repo_id=atang/aic_sfp_demos \
-  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset \
-  --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
-  --dataset.push_to_hub=false \
-  --dataset.private=true \
-  --play_sounds=false \
-  --display_data=true \
-  --resume=true
-```
-
-This picks up from the last episode number instead of starting over.
+> **What `--resume=true` does:** It opens the existing dataset and appends new episodes after the last one. Without it, lerobot tries to create the dataset directory from scratch and **crashes** with `FileExistsError`.
 
 ### Starting fresh (deleting an existing dataset)
 
