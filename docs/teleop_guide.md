@@ -298,6 +298,33 @@ A demo where you get close to the port but don't quite insert is still useful �
 
 ---
 
+## 7b. What to Keep vs. What to Discard
+
+ACT, Diffusion Policy, VQ-BeT, and other behavior cloning architectures learn to imitate **every frame** of your dataset equally. They don't distinguish "good" from "bad" episodes. This means the composition of your dataset directly shapes the policy's behavior.
+
+### Keep these episodes (press Right Arrow)
+
+- **Overshoot then correct:** You go past the port, realize it, adjust laterally, and insert. This is the **most valuable** type of demo — the policy learns what "being off target" looks like and how to recover. A dataset of only perfect approaches produces a brittle policy that can't handle the slightest misalignment during eval.
+- **Wrong angle, then adjust:** You approach at a slight angle, notice the connector isn't aligned, rotate or nudge, and complete the insertion. Same logic — the correction IS the training signal.
+- **Bump and retry:** You descend too early, the connector hits the port lip, you back up with `f`, realign, and retry successfully. Teaches the policy contact recovery.
+- **Near-miss without insertion:** You get close, align well, but the episode ends before full insertion. The approach trajectory is still valuable data for learning how to navigate toward the target.
+
+### Discard these episodes (press Left Arrow)
+
+- **Completely wrong location:** You navigate to the wrong side of the board, nowhere near the target port.
+- **Random key mashing:** You lost orientation and pressed keys randomly with no meaningful intent.
+- **Gave up and stopped:** You stopped moving halfway through with no attempt to complete the task. The policy would learn "stop moving" as a valid action.
+
+### Why imperfect demos matter more than you think
+
+If 90% of your demos are clean approaches and 10% have corrections and overshoots that eventually succeed, the policy learns that the dominant behavior is a smooth approach, but it **also** learns what recovery looks like from the 10%. This is exactly what you want — a policy that usually goes straight to the target but knows how to fix itself when it's off.
+
+If you only collect flawless, identical-looking demos, the policy becomes fragile. The moment the eval board is in a slightly different position than anything in training, the policy has no concept of "I'm off, how do I correct?" and fails.
+
+**Bottom line:** keep every episode where you made a meaningful attempt at the task, regardless of how messy the path was. The messy ones with successful corrections are worth more than the clean ones.
+
+---
+
 ## 8. Monitoring and Debugging
 
 ### Watch the robot state in real time
