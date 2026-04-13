@@ -66,6 +66,14 @@ ros2 run aic_teleoperation cartesian_keyboard_teleop
 ros2 topic echo /scoring/insertion_event
 ```
 
+**Terminal 4 (optional) — Monitor force during teleoperation:**
+```bash
+source /ws_aic/install/setup.bash
+python3 /run/host/scratch2/atang/ws_aic/scripts/force_monitor.py
+```
+
+Shows a live dashboard with the tared force magnitude, a color-coded bar, and cumulative time above the 20 N scoring threshold. Prints a session summary when you Ctrl+C.
+
 ---
 
 ## 2. Keyboard Controls — Complete Reference
@@ -312,6 +320,20 @@ ros2 topic echo /scoring/insertion_event
 ```
 
 This only fires when the connector is properly seated in the correct port. If you descend fully and this doesn't fire, the insertion failed — back up and try again.
+
+### Monitor force (avoid the -12 pt penalty)
+
+```bash
+source /ws_aic/install/setup.bash
+python3 /run/host/scratch2/atang/ws_aic/scripts/force_monitor.py
+```
+
+This runs the force monitor script which shows a live, color-coded dashboard:
+- **Green** — tared force is well below 20 N, you're safe
+- **Yellow** — approaching the 20 N threshold, ease up
+- **Red** — above 20 N, cumulative time is counting toward the 1 s limit
+
+The scoring penalty is **-12 points** if your tared force magnitude exceeds **20 N** for more than **1 second cumulative** across the entire run. The monitor tracks this in real time and shows the running total. When you Ctrl+C, it prints a session summary.
 
 ### Reset the simulation
 
