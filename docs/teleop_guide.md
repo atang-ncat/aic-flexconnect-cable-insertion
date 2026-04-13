@@ -42,7 +42,7 @@ pixi run lerobot-record \
   --teleop.type=aic_keyboard_ee --teleop.id=aic \
   --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
   --dataset.repo_id=atang/aic_sfp_demos \
-  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset/sfp \
   --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
   --dataset.push_to_hub=false \
   --dataset.private=true \
@@ -467,15 +467,15 @@ Episodes auto-save after 60 seconds (`episode_time_s: 60`). If you don't press R
 The dataset is saved locally to:
 
 ```
-/scratch2/atang/ws_aic/teleop-dataset/atang/aic_sfp_demos/
+/scratch2/atang/ws_aic/teleop-dataset/sfp/
 ```
 
-This is set by `--dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset` in the recording command. Keeping datasets inside the workspace (rather than `/tmp`) ensures they persist across container restarts.
+This is set by `--dataset.root` in the recording command. Note: `--dataset.root` is the **full path** to the dataset directory — lerobot does NOT append `repo_id` to it. The `repo_id` is only used for Hub identification. Keeping datasets inside the workspace (rather than `/tmp`) ensures they persist across container restarts.
 
 The directory structure:
 
 ```
-atang/aic_sfp_demos/
+teleop-dataset/sfp/
 ├── meta/
 │   ├── info.json          # dataset metadata (fps, features, etc.)
 │   ├── episodes.jsonl     # per-episode metadata
@@ -501,14 +501,14 @@ The main recording command in Section 1 already includes `--resume=true`. Just c
 
 ### Starting fresh (deleting an existing dataset)
 
-If you want to discard all previously recorded episodes and start over from episode 0, delete the dataset directory for the specific `repo_id` you are using:
+If you want to discard all previously recorded episodes and start over from episode 0, delete the dataset directory (the path from `--dataset.root`):
 
 ```bash
 # Delete the SFP dataset and start over
-rm -rf /scratch2/atang/ws_aic/teleop-dataset/atang/aic_sfp_demos
+rm -rf /scratch2/atang/ws_aic/teleop-dataset/sfp
 
 # Delete the SC dataset and start over
-rm -rf /scratch2/atang/ws_aic/teleop-dataset/atang/aic_sc_demos
+rm -rf /scratch2/atang/ws_aic/teleop-dataset/sc
 ```
 
 After deleting, run the recording command from Section 1 **without** `--resume=true` — it will create a fresh dataset from scratch.
