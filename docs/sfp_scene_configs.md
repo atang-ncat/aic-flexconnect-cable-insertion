@@ -1,24 +1,32 @@
 # SFP Insertion — Scene Configurations for Data Collection
 
-> **Goal:** Collect a diverse, comprehensive dataset for the SFP-to-NIC insertion task.
-> Record **4–5 episodes per configuration**, then move to the next one.
-> All configs use `nic_card_mount_0` (slot 0, the default evaluation slot).
+> **Goal:** 200 episodes across ~40 configurations for a robust SFP insertion dataset.
+> Record **5 episodes per configuration**, then move to the next one.
 
 ---
 
-## Quick Reference
+## What Varies During Evaluation (and therefore in our data)
 
-| Parameter | What it does | Range |
-|-----------|-------------|-------|
-| `nic_card_mount_0_translation` | Slides NIC card along X axis (left/right on board) | [-0.048, 0.036] m (xacro); eval clamps to [-0.0215, 0.0234] |
-| `task_board_yaw` | Rotates entire board around Z axis | Default 3.1415 rad; small variations ±0.15 rad (~±9°) |
-| `sc_port_0_present` / `sc_port_0_translation` | Adds SC port as visual distractor | [-0.055, 0.055] m |
+Based on `qualification_phase.md` and `sample_config.yaml`, the eval randomizes:
+
+| Dimension | What changes | Eval range | Why it matters |
+|-----------|-------------|------------|----------------|
+| **NIC rail slot** | Which of the 5 Y-positions (0–4) the NIC card sits on | Any of `nic_card_mount_0` through `_4` | Completely different approach trajectory for each slot |
+| **NIC translation** | Slides NIC card along X on its rail | [-0.0215, 0.0234] m | Changes lateral alignment target |
+| **NIC yaw** | Rotates NIC card on its rail | Small offsets (sample uses 0.0) | Changes insertion angle |
+| **Board x** | Shifts board forward/back from robot | ~0.13–0.17 m (sample: 0.15) | Changes reach distance |
+| **Board y** | Shifts board left/right | ~-0.25 to 0.0 m (sample: -0.2, 0.0) | Changes lateral approach |
+| **Board yaw** | Rotates entire board | ~2.9–3.3 rad (sample: 3.0, 3.1415) | Changes approach angle |
+| **Distractors** | SC ports, mount rails, extra NIC cards | Various | Visual clutter the policy must ignore |
+| **Grasp noise** | Small perturbations in cable grasp | ~2mm, ~0.04 rad | Natural sim variance handles this |
+
+**Fixed (does not vary):** cameras, robot home pose, cable type (`sfp_sc_cable`).
 
 ---
 
 ## Base Command Template
 
-All configs use this base. Replace `<PARAMS>` with the config-specific lines.
+All configs follow this pattern. Replace `<CONFIG_PARAMS>` with the lines from each config below.
 
 ```bash
 source ~/lab/ws_aic/setup_dev.sh
@@ -27,366 +35,627 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
   spawn_task_board:=true spawn_cable:=true \
   attach_cable_to_gripper:=true \
   cable_type:=sfp_sc_cable \
-  <PARAMS>
+  <CONFIG_PARAMS>
 ```
 
 ---
 
-## Configurations
+## Group 1 — NIC Rail Slot Variation (25 episodes)
 
-### Group A — Nominal / Centered (warm-up configs)
+The NIC card can sit on any of 5 rail slots (different Y positions). This is the **biggest** visual change between trials — the card appears at completely different locations on the board.
 
-These are the "easy" configs. Use them first to build muscle memory and get clean baseline demos.
+All use default board pose (x=0.15, y=-0.2, yaw=3.1415) and center NIC translation (0.0).
 
-#### A1: Dead center, default yaw
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0
-```
-**Episodes: 5** | Difficulty: Easy | The default setup.
-
-#### A2: Slight right shift, default yaw
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005
-```
-**Episodes: 4** | Difficulty: Easy | Barely different from center — good for consistency.
-
-#### A3: Slight left shift, default yaw
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.005
-```
-**Episodes: 4** | Difficulty: Easy | Mirror of A2.
+| Config | NIC slot | Params | Episodes |
+|--------|----------|--------|----------|
+| **1.1** | Slot 0 | `nic_card_mount_0_present:=true` | 5 |
+| **1.2** | Slot 1 | `nic_card_mount_1_present:=true` | 5 |
+| **1.3** | Slot 2 | `nic_card_mount_2_present:=true` | 5 |
+| **1.4** | Slot 3 | `nic_card_mount_3_present:=true` | 5 |
+| **1.5** | Slot 4 | `nic_card_mount_4_present:=true` | 5 |
 
 ---
 
-### Group B — Moderate Variation (within eval range)
+## Group 2 — NIC Translation on Slot 0 (30 episodes)
 
-The eval engine clamps NIC translation to [-0.0215, 0.0234]. These configs cover that range.
+Slot 0 with the NIC card slid along its rail. Covers the full eval clamp range and some beyond.
 
-#### B1: Moderate right shift
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.015
-```
-**Episodes: 5** | Difficulty: Medium
-
-#### B2: Moderate left shift
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.015
-```
-**Episodes: 5** | Difficulty: Medium
-
-#### B3: Right edge of eval range
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.023
-```
-**Episodes: 5** | Difficulty: Medium-Hard | Near the eval clamp limit.
-
-#### B4: Left edge of eval range
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.021
-```
-**Episodes: 5** | Difficulty: Medium-Hard | Near the eval clamp limit.
+| Config | Translation | Difficulty | Params | Episodes |
+|--------|-------------|-----------|--------|----------|
+| **2.1** | 0.0 (center) | Easy | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0` | 5 |
+| **2.2** | +0.01 | Easy | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.01` | 5 |
+| **2.3** | -0.01 | Easy | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.01` | 5 |
+| **2.4** | +0.023 (eval max) | Medium | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.023` | 5 |
+| **2.5** | -0.021 (eval min) | Medium | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.021` | 5 |
+| **2.6** | +0.036 (xacro max) | Hard | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.036` | 5 |
 
 ---
 
-### Group C — Board Yaw Variation
+## Group 3 — NIC Translation on Other Slots (30 episodes)
 
-Same NIC translations but with the board rotated. Teaches the policy to handle approach angle changes.
+Same translation variation but on slots 1 and 2 to combine slot + translation diversity.
 
-#### C1: Board rotated clockwise, center NIC
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0 \
-  task_board_yaw:=3.05
-```
-**Episodes: 4** | Difficulty: Medium | ~5° clockwise from default.
-
-#### C2: Board rotated counter-clockwise, center NIC
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0 \
-  task_board_yaw:=3.24
-```
-**Episodes: 4** | Difficulty: Medium | ~5° counter-clockwise from default.
-
-#### C3: Board rotated clockwise + right shift
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.015 \
-  task_board_yaw:=3.05
-```
-**Episodes: 4** | Difficulty: Medium-Hard | Combined variation.
-
-#### C4: Board rotated counter-clockwise + left shift
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.015 \
-  task_board_yaw:=3.24
-```
-**Episodes: 4** | Difficulty: Medium-Hard | Combined variation.
+| Config | Slot | Translation | Params | Episodes |
+|--------|------|-------------|--------|----------|
+| **3.1** | 1 | +0.015 | `nic_card_mount_1_present:=true nic_card_mount_1_translation:=0.015` | 5 |
+| **3.2** | 1 | -0.015 | `nic_card_mount_1_present:=true nic_card_mount_1_translation:=-0.015` | 5 |
+| **3.3** | 1 | +0.023 | `nic_card_mount_1_present:=true nic_card_mount_1_translation:=0.023` | 5 |
+| **3.4** | 2 | 0.0 | `nic_card_mount_2_present:=true nic_card_mount_2_translation:=0.0` | 5 |
+| **3.5** | 2 | +0.02 | `nic_card_mount_2_present:=true nic_card_mount_2_translation:=0.02` | 5 |
+| **3.6** | 2 | -0.02 | `nic_card_mount_2_present:=true nic_card_mount_2_translation:=-0.02` | 5 |
 
 ---
 
-### Group D — Edge Cases (beyond eval range, for robustness)
+## Group 4 — Board Position Variation (30 episodes)
 
-These push past the eval clamp limits. The policy may never see these exact values during scoring, but training on extremes improves generalization at the boundaries.
+The entire board shifts in x (forward/back) and y (left/right). Changes how far the robot must reach and the camera perspective.
 
-#### D1: Far right (xacro max)
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.036
-```
-**Episodes: 4** | Difficulty: Hard | Max rightward shift.
+All use slot 0 with centered NIC translation.
 
-#### D2: Far left (xacro limit)
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.04
-```
-**Episodes: 4** | Difficulty: Hard | Near max leftward shift.
-
-#### D3: Far right + board rotated
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.036 \
-  task_board_yaw:=3.0
-```
-**Episodes: 4** | Difficulty: Hard | Worst-case combined variation.
+| Config | Board x | Board y | Board yaw | Params | Episodes |
+|--------|---------|---------|-----------|--------|----------|
+| **4.1** | 0.15 | -0.2 | 3.1415 | `nic_card_mount_0_present:=true task_board_x:=0.15 task_board_y:=-0.2` | 5 |
+| **4.2** | 0.13 | -0.2 | 3.1415 | `nic_card_mount_0_present:=true task_board_x:=0.13 task_board_y:=-0.2` | 5 |
+| **4.3** | 0.17 | -0.2 | 3.1415 | `nic_card_mount_0_present:=true task_board_x:=0.17 task_board_y:=-0.2` | 5 |
+| **4.4** | 0.15 | -0.15 | 3.1415 | `nic_card_mount_0_present:=true task_board_x:=0.15 task_board_y:=-0.15` | 5 |
+| **4.5** | 0.15 | -0.25 | 3.1415 | `nic_card_mount_0_present:=true task_board_x:=0.15 task_board_y:=-0.25` | 5 |
+| **4.6** | 0.17 | -0.15 | 3.1415 | `nic_card_mount_0_present:=true task_board_x:=0.17 task_board_y:=-0.15` | 5 |
 
 ---
 
-### Group E — With Distractors
+## Group 5 — Board Yaw Variation (25 episodes)
 
-Same insertion task, but the SC port is also present on the board. Teaches the policy not to get confused by extra geometry.
+Board rotated around Z axis. Combined with different slots and translations.
 
-#### E1: Center NIC + SC port present
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005 \
-  sc_port_0_present:=true sc_port_0_translation:=-0.04
-```
-**Episodes: 4** | Difficulty: Medium | Visual distractor.
+| Config | Slot | NIC trans | Board yaw | Params | Episodes |
+|--------|------|-----------|-----------|--------|----------|
+| **5.1** | 0 | 0.0 | 3.05 | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0 task_board_yaw:=3.05` | 5 |
+| **5.2** | 0 | 0.0 | 3.24 | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0 task_board_yaw:=3.24` | 5 |
+| **5.3** | 0 | +0.02 | 3.0 | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 task_board_yaw:=3.0` | 5 |
+| **5.4** | 1 | 0.0 | 3.05 | `nic_card_mount_1_present:=true nic_card_mount_1_translation:=0.0 task_board_yaw:=3.05` | 5 |
+| **5.5** | 1 | -0.015 | 3.24 | `nic_card_mount_1_present:=true nic_card_mount_1_translation:=-0.015 task_board_yaw:=3.24` | 5 |
 
-#### E2: Shifted NIC + SC port present
-```
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 \
-  sc_port_0_present:=true sc_port_0_translation:=0.0
-```
-**Episodes: 4** | Difficulty: Medium-Hard | Port and distractor in different positions.
+---
+
+## Group 6 — NIC Yaw Offset (20 episodes)
+
+The NIC card itself is slightly rotated on its rail. Changes the insertion angle.
+
+| Config | Slot | NIC trans | NIC yaw | Params | Episodes |
+|--------|------|-----------|---------|--------|----------|
+| **6.1** | 0 | 0.0 | +0.05 | `nic_card_mount_0_present:=true nic_card_mount_0_yaw:=0.05` | 5 |
+| **6.2** | 0 | 0.0 | -0.05 | `nic_card_mount_0_present:=true nic_card_mount_0_yaw:=-0.05` | 5 |
+| **6.3** | 0 | +0.015 | +0.08 | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.015 nic_card_mount_0_yaw:=0.08` | 5 |
+| **6.4** | 1 | 0.0 | +0.05 | `nic_card_mount_1_present:=true nic_card_mount_1_yaw:=0.05` | 5 |
+
+---
+
+## Group 7 — Combined Variation (20 episodes)
+
+Multiple dimensions varying at once — the hardest, most realistic configs. These mimic what eval actually looks like.
+
+| Config | Slot | NIC trans | NIC yaw | Board x | Board y | Board yaw | Params | Episodes |
+|--------|------|-----------|---------|---------|---------|-----------|--------|----------|
+| **7.1** | 0 | +0.02 | +0.05 | 0.15 | -0.2 | 3.05 | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 nic_card_mount_0_yaw:=0.05 task_board_yaw:=3.05` | 5 |
+| **7.2** | 1 | -0.015 | -0.05 | 0.17 | -0.15 | 3.24 | `nic_card_mount_1_present:=true nic_card_mount_1_translation:=-0.015 nic_card_mount_1_yaw:=-0.05 task_board_x:=0.17 task_board_y:=-0.15 task_board_yaw:=3.24` | 5 |
+| **7.3** | 2 | +0.01 | 0.0 | 0.13 | -0.25 | 3.1 | `nic_card_mount_2_present:=true nic_card_mount_2_translation:=0.01 task_board_x:=0.13 task_board_y:=-0.25 task_board_yaw:=3.1` | 5 |
+| **7.4** | 3 | -0.01 | +0.03 | 0.16 | -0.18 | 3.2 | `nic_card_mount_3_present:=true nic_card_mount_3_translation:=-0.01 nic_card_mount_3_yaw:=0.03 task_board_x:=0.16 task_board_y:=-0.18 task_board_yaw:=3.2` | 5 |
+
+---
+
+## Group 8 — With Distractors (20 episodes)
+
+Other board components present as visual distractors. During eval, the board often has SC ports, mount rails, and even extra NIC cards visible.
+
+| Config | Slot | NIC trans | Distractors | Params | Episodes |
+|--------|------|-----------|-------------|--------|----------|
+| **8.1** | 0 | 0.005 | SC port | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005 sc_port_0_present:=true sc_port_0_translation:=-0.04` | 5 |
+| **8.2** | 0 | +0.02 | SC port shifted | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 sc_port_0_present:=true sc_port_0_translation:=0.03` | 5 |
+| **8.3** | 1 | 0.0 | SC port + yaw | `nic_card_mount_1_present:=true sc_port_0_present:=true sc_port_0_translation:=-0.02 task_board_yaw:=3.1` | 5 |
+| **8.4** | 0 | -0.01 | SC + board shift | `nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.01 sc_port_0_present:=true sc_port_0_translation:=0.0 task_board_x:=0.17 task_board_y:=-0.15` | 5 |
 
 ---
 
 ## Episode Count Summary
 
-| Group | Configs | Episodes/Config | Total |
-|-------|---------|----------------|-------|
-| A — Nominal | 3 | 4–5 | ~13 |
-| B — Moderate | 4 | 5 | 20 |
-| C — Yaw variation | 4 | 4 | 16 |
-| D — Edge cases | 3 | 4 | 12 |
-| E — Distractors | 2 | 4 | 8 |
-| **Total** | **16** | | **~69** |
-
-This gives ~69 episodes. You can trim Group D or E if pressed for time, but try to get at least all of Groups A, B, and C (~49 episodes). The eval-range configs (A + B) are the highest priority.
-
----
-
-## Recommended Recording Order
-
-1. **A1** — Start here to warm up. Get 5 clean demos.
-2. **A2, A3** — Still easy, slight variation. Build confidence.
-3. **B1, B2** — Moderate shifts. Take your time.
-4. **C1, C2** — Yaw changes. The approach feels different — practice a bit.
-5. **B3, B4** — Edge of eval range. These matter for robustness.
-6. **C3, C4** — Combined variation. The hardest "realistic" configs.
-7. **E1, E2** — Distractor configs. Same skill, different scenery.
-8. **D1, D2, D3** — Extreme edge cases. Do these last — they push your limits.
-
-> **Take a 5-minute break after every 15–20 episodes.** Fatigue makes demos sloppy.
+| Group | Focus | Configs | Episodes |
+|-------|-------|---------|----------|
+| 1 — Rail slots | Which slot (0–4) | 5 | 25 |
+| 2 — NIC translation (slot 0) | Lateral shift | 6 | 30 |
+| 3 — NIC translation (slots 1–2) | Slot + shift combo | 6 | 30 |
+| 4 — Board position | x, y variation | 6 | 30 |
+| 5 — Board yaw | Rotation | 5 | 25 |
+| 6 — NIC yaw | Card orientation | 4 | 20 |
+| 7 — Combined | Multi-dimension | 4 | 20 |
+| 8 — Distractors | Visual clutter | 4 | 20 |
+| **Total** | | **40** | **200** |
 
 ---
 
-## Full Copy-Paste Commands
+## Priority Order for Recording
 
-For convenience, here is every launch command ready to paste.
+If you can't finish all 200, here's what matters most:
 
-### A1
+1. **Groups 1 + 2** (55 episodes) — Covers all 5 slots and the full NIC translation range. **Absolute minimum viable dataset.**
+2. **Group 3** (30 episodes) — Slot + translation combos. Strongly recommended.
+3. **Groups 4 + 5** (55 episodes) — Board pose variation. Important for real eval.
+4. **Groups 6 + 7 + 8** (60 episodes) — NIC yaw, combined, and distractors. Polish for robustness.
+
+---
+
+## Recommended Session Plan
+
+Each session is ~20 minutes of active recording (plus breaks).
+
+| Session | Configs | Episodes | Focus |
+|---------|---------|----------|-------|
+| **1** | 1.1–1.5 | 25 | All 5 rail slots |
+| **2** | 2.1–2.6 | 30 | NIC translation range |
+| **3** | 3.1–3.6 | 30 | Translation on other slots |
+| **4** | 4.1–4.6 | 30 | Board position |
+| **5** | 5.1–5.5 | 25 | Board yaw |
+| **6** | 6.1–6.4 | 20 | NIC yaw |
+| **7** | 7.1–7.4, 8.1–8.4 | 40 | Combined + distractors |
+
+> **Break 5 minutes between sessions.** Don't record more than 2 sessions in a row without a longer break.
+
+---
+
+## Full Copy-Paste Launch Commands
+
+### Group 1 — Rail Slots
+
+**1.1 — Slot 0**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true
+```
+
+**1.2 — Slot 1**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true
+```
+
+**1.3 — Slot 2**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_2_present:=true
+```
+
+**1.4 — Slot 3**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_3_present:=true
+```
+
+**1.5 — Slot 4**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_4_present:=true
+```
+
+### Group 2 — NIC Translation (Slot 0)
+
+**2.1 — Center**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
   nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0
 ```
 
-### A2
+**2.2 — Right +0.01**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.01
 ```
 
-### A3
+**2.3 — Left -0.01**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.005
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.01
 ```
 
-### B1
+**2.4 — Eval max +0.023**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.015
-```
-
-### B2
-```bash
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.015
-```
-
-### B3
-```bash
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
   nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.023
 ```
 
-### B4
+**2.5 — Eval min -0.021**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
   nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.021
 ```
 
-### C1
+**2.6 — Beyond eval +0.036**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0 \
-  task_board_yaw:=3.05
-```
-
-### C2
-```bash
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.0 \
-  task_board_yaw:=3.24
-```
-
-### C3
-```bash
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.015 \
-  task_board_yaw:=3.05
-```
-
-### C4
-```bash
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.015 \
-  task_board_yaw:=3.24
-```
-
-### D1
-```bash
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
   nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.036
 ```
 
-### D2
+### Group 3 — NIC Translation (Slots 1–2)
+
+**3.1 — Slot 1, +0.015**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.04
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true nic_card_mount_1_translation:=0.015
 ```
 
-### D3
+**3.2 — Slot 1, -0.015**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.036 \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true nic_card_mount_1_translation:=-0.015
+```
+
+**3.3 — Slot 1, +0.023**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true nic_card_mount_1_translation:=0.023
+```
+
+**3.4 — Slot 2, center**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_2_present:=true nic_card_mount_2_translation:=0.0
+```
+
+**3.5 — Slot 2, +0.02**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_2_present:=true nic_card_mount_2_translation:=0.02
+```
+
+**3.6 — Slot 2, -0.02**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_2_present:=true nic_card_mount_2_translation:=-0.02
+```
+
+### Group 4 — Board Position
+
+**4.1 — Default pose**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_x:=0.15 task_board_y:=-0.2
+```
+
+**4.2 — Board closer (x=0.13)**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_x:=0.13 task_board_y:=-0.2
+```
+
+**4.3 — Board further (x=0.17)**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_x:=0.17 task_board_y:=-0.2
+```
+
+**4.4 — Board shifted right (y=-0.15)**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_x:=0.15 task_board_y:=-0.15
+```
+
+**4.5 — Board shifted left (y=-0.25)**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_x:=0.15 task_board_y:=-0.25
+```
+
+**4.6 — Board further + shifted right**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_x:=0.17 task_board_y:=-0.15
+```
+
+### Group 5 — Board Yaw
+
+**5.1 — Yaw 3.05 (~5° CW)**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_yaw:=3.05
+```
+
+**5.2 — Yaw 3.24 (~6° CCW)**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true \
+  task_board_yaw:=3.24
+```
+
+**5.3 — Yaw 3.0 + NIC shifted**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 \
   task_board_yaw:=3.0
 ```
 
-### E1
+**5.4 — Slot 1, yaw 3.05**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true \
+  task_board_yaw:=3.05
+```
+
+**5.5 — Slot 1, yaw 3.24 + NIC shifted**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true nic_card_mount_1_translation:=-0.015 \
+  task_board_yaw:=3.24
+```
+
+### Group 6 — NIC Yaw
+
+**6.1 — NIC yaw +0.05 rad**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_yaw:=0.05
+```
+
+**6.2 — NIC yaw -0.05 rad**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_yaw:=-0.05
+```
+
+**6.3 — NIC yaw + translation**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.015 nic_card_mount_0_yaw:=0.08
+```
+
+**6.4 — Slot 1, NIC yaw**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true nic_card_mount_1_yaw:=0.05
+```
+
+### Group 7 — Combined
+
+**7.1**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 nic_card_mount_0_yaw:=0.05 \
+  task_board_yaw:=3.05
+```
+
+**7.2**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true nic_card_mount_1_translation:=-0.015 nic_card_mount_1_yaw:=-0.05 \
+  task_board_x:=0.17 task_board_y:=-0.15 task_board_yaw:=3.24
+```
+
+**7.3**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_2_present:=true nic_card_mount_2_translation:=0.01 \
+  task_board_x:=0.13 task_board_y:=-0.25 task_board_yaw:=3.1
+```
+
+**7.4**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_3_present:=true nic_card_mount_3_translation:=-0.01 nic_card_mount_3_yaw:=0.03 \
+  task_board_x:=0.16 task_board_y:=-0.18 task_board_yaw:=3.2
+```
+
+### Group 8 — Distractors
+
+**8.1 — SC port present**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
   nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005 \
   sc_port_0_present:=true sc_port_0_translation:=-0.04
 ```
 
-### E2
+**8.2 — SC port shifted**
 ```bash
 ros2 launch aic_bringup aic_gz_bringup.launch.py \
   ground_truth:=true start_aic_engine:=false \
   spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
   nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.02 \
-  sc_port_0_present:=true sc_port_0_translation:=0.0
+  sc_port_0_present:=true sc_port_0_translation:=0.03
+```
+
+**8.3 — Slot 1 + SC port + board yaw**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_1_present:=true \
+  sc_port_0_present:=true sc_port_0_translation:=-0.02 \
+  task_board_yaw:=3.1
+```
+
+**8.4 — SC port + board position shift**
+```bash
+ros2 launch aic_bringup aic_gz_bringup.launch.py \
+  ground_truth:=true start_aic_engine:=false \
+  spawn_task_board:=true spawn_cable:=true \
+  attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+  nic_card_mount_0_present:=true nic_card_mount_0_translation:=-0.01 \
+  sc_port_0_present:=true sc_port_0_translation:=0.0 \
+  task_board_x:=0.17 task_board_y:=-0.15
 ```
 
 ---
 
-## Tracking Your Progress
+## Progress Checklist
 
-Use this checklist to track which configs you've completed. Mark the checkbox and note the episode range.
+### Group 1 — Rail Slots
+- [ ] **1.1** Slot 0, center (ep ___–___)
+- [ ] **1.2** Slot 1, center (ep ___–___)
+- [ ] **1.3** Slot 2, center (ep ___–___)
+- [ ] **1.4** Slot 3, center (ep ___–___)
+- [ ] **1.5** Slot 4, center (ep ___–___)
 
-- [ ] **A1** — center, default yaw (episodes ___–___)
-- [ ] **A2** — +0.005, default yaw (episodes ___–___)
-- [ ] **A3** — -0.005, default yaw (episodes ___–___)
-- [ ] **B1** — +0.015, default yaw (episodes ___–___)
-- [ ] **B2** — -0.015, default yaw (episodes ___–___)
-- [ ] **B3** — +0.023, eval edge (episodes ___–___)
-- [ ] **B4** — -0.021, eval edge (episodes ___–___)
-- [ ] **C1** — center, yaw 3.05 (episodes ___–___)
-- [ ] **C2** — center, yaw 3.24 (episodes ___–___)
-- [ ] **C3** — +0.015, yaw 3.05 (episodes ___–___)
-- [ ] **C4** — -0.015, yaw 3.24 (episodes ___–___)
-- [ ] **D1** — +0.036, far right (episodes ___–___)
-- [ ] **D2** — -0.04, far left (episodes ___–___)
-- [ ] **D3** — +0.036, yaw 3.0 (episodes ___–___)
-- [ ] **E1** — +0.005, SC distractor (episodes ___–___)
-- [ ] **E2** — +0.02, SC distractor (episodes ___–___)
+### Group 2 — NIC Translation (Slot 0)
+- [ ] **2.1** trans=0.0 (ep ___–___)
+- [ ] **2.2** trans=+0.01 (ep ___–___)
+- [ ] **2.3** trans=-0.01 (ep ___–___)
+- [ ] **2.4** trans=+0.023 eval max (ep ___–___)
+- [ ] **2.5** trans=-0.021 eval min (ep ___–___)
+- [ ] **2.6** trans=+0.036 beyond eval (ep ___–___)
+
+### Group 3 — NIC Translation (Slots 1–2)
+- [ ] **3.1** slot 1, +0.015 (ep ___–___)
+- [ ] **3.2** slot 1, -0.015 (ep ___–___)
+- [ ] **3.3** slot 1, +0.023 (ep ___–___)
+- [ ] **3.4** slot 2, center (ep ___–___)
+- [ ] **3.5** slot 2, +0.02 (ep ___–___)
+- [ ] **3.6** slot 2, -0.02 (ep ___–___)
+
+### Group 4 — Board Position
+- [ ] **4.1** default pose (ep ___–___)
+- [ ] **4.2** x=0.13 closer (ep ___–___)
+- [ ] **4.3** x=0.17 further (ep ___–___)
+- [ ] **4.4** y=-0.15 right (ep ___–___)
+- [ ] **4.5** y=-0.25 left (ep ___–___)
+- [ ] **4.6** x=0.17 y=-0.15 (ep ___–___)
+
+### Group 5 — Board Yaw
+- [ ] **5.1** yaw=3.05 (ep ___–___)
+- [ ] **5.2** yaw=3.24 (ep ___–___)
+- [ ] **5.3** yaw=3.0 + NIC shift (ep ___–___)
+- [ ] **5.4** slot 1, yaw=3.05 (ep ___–___)
+- [ ] **5.5** slot 1, yaw=3.24 + NIC shift (ep ___–___)
+
+### Group 6 — NIC Yaw
+- [ ] **6.1** NIC yaw=+0.05 (ep ___–___)
+- [ ] **6.2** NIC yaw=-0.05 (ep ___–___)
+- [ ] **6.3** NIC yaw + translation (ep ___–___)
+- [ ] **6.4** slot 1, NIC yaw (ep ___–___)
+
+### Group 7 — Combined
+- [ ] **7.1** slot 0 multi-var (ep ___–___)
+- [ ] **7.2** slot 1 multi-var (ep ___–___)
+- [ ] **7.3** slot 2 multi-var (ep ___–___)
+- [ ] **7.4** slot 3 multi-var (ep ___–___)
+
+### Group 8 — Distractors
+- [ ] **8.1** SC port (ep ___–___)
+- [ ] **8.2** SC port shifted (ep ___–___)
+- [ ] **8.3** slot 1 + SC + yaw (ep ___–___)
+- [ ] **8.4** SC + board shift (ep ___–___)
