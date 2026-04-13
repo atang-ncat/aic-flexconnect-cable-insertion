@@ -37,8 +37,6 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
 **Terminal 2 — Start lerobot-record (records data + gives you keyboard teleop):**
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic/
-export UV_CACHE_DIR=/tmp/uv-cache-atang
-export RATTLER_CACHE_DIR=/tmp/rattler-cache-atang
 pixi run lerobot-record \
   --robot.type=aic_controller --robot.id=aic \
   --teleop.type=aic_keyboard_ee --teleop.id=aic \
@@ -52,7 +50,7 @@ pixi run lerobot-record \
   --display_data=true
 ```
 
-> **Tip:** Add the two `export` lines to your `~/.bashrc` so you don't have to type them every session.
+> **Note:** The `UV_CACHE_DIR`, `RATTLER_CACHE_DIR`, and `XDG_CACHE_HOME` environment variables are already set in `~/.bashrc`, so you don't need to export them manually.
 
 > **If you've already recorded episodes:** This command only works the very first time (to create a new dataset). On subsequent sessions, you **must** add `--resume=true` or you will get a `FileExistsError` crash. See [Resuming a previous session](#resuming-a-previous-session) below.
 
@@ -451,8 +449,6 @@ atang/aic_sfp_demos/
 
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic/
-export UV_CACHE_DIR=/tmp/uv-cache-atang
-export RATTLER_CACHE_DIR=/tmp/rattler-cache-atang
 pixi run lerobot-record \
   --robot.type=aic_controller --robot.id=aic \
   --teleop.type=aic_keyboard_ee --teleop.id=aic \
