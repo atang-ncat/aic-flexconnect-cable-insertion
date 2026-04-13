@@ -39,12 +39,12 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
 cd /run/host/scratch2/atang/ws_aic/src/aic/
 export UV_CACHE_DIR=/tmp/uv-cache-atang
 export RATTLER_CACHE_DIR=/tmp/rattler-cache-atang
-export XDG_CACHE_HOME=/tmp/cache-atang
 pixi run lerobot-record \
   --robot.type=aic_controller --robot.id=aic \
   --teleop.type=aic_keyboard_ee --teleop.id=aic \
   --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
   --dataset.repo_id=atang/aic_sfp_demos \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset \
   --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
   --dataset.push_to_hub=false \
   --dataset.private=true \
@@ -52,7 +52,9 @@ pixi run lerobot-record \
   --display_data=true
 ```
 
-> **Tip:** Add the three `export` lines to your `~/.bashrc` so you don't have to type them every session.
+> **Tip:** Add the two `export` lines to your `~/.bashrc` so you don't have to type them every session.
+
+> **If you've already recorded episodes:** This command only works the very first time (to create a new dataset). On subsequent sessions, you **must** add `--resume=true` or you will get a `FileExistsError` crash. See [Resuming a previous session](#resuming-a-previous-session) below.
 
 **Terminal 2 (alternative) — Standalone teleop for practice (no recording):**
 ```bash
@@ -417,10 +419,10 @@ Episodes auto-save after 60 seconds (`episode_time_s: 60`). If you don't press R
 The dataset is saved locally to:
 
 ```
-~/.cache/huggingface/lerobot/atang/aic_sfp_demos/
+/scratch2/atang/ws_aic/teleop-dataset/atang/aic_sfp_demos/
 ```
 
-(Or if you set `XDG_CACHE_HOME`, it's under `$XDG_CACHE_HOME/huggingface/lerobot/atang/aic_sfp_demos/`.)
+This is set by `--dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset` in the recording command. Keeping datasets inside the workspace (rather than `/tmp`) ensures they persist across container restarts.
 
 The directory structure:
 
@@ -445,14 +447,18 @@ atang/aic_sfp_demos/
 
 ### Resuming a previous session
 
-To add more episodes to an existing dataset, add `--resume=true`:
+> **Important:** If you have already recorded episodes and want to add more, you **must** pass `--resume=true`. Without it, lerobot tries to create the dataset directory from scratch and **crashes** with `FileExistsError` because the directory already exists.
 
 ```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic/
+export UV_CACHE_DIR=/tmp/uv-cache-atang
+export RATTLER_CACHE_DIR=/tmp/rattler-cache-atang
 pixi run lerobot-record \
   --robot.type=aic_controller --robot.id=aic \
   --teleop.type=aic_keyboard_ee --teleop.id=aic \
   --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
   --dataset.repo_id=atang/aic_sfp_demos \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset \
   --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
   --dataset.push_to_hub=false \
   --dataset.private=true \
@@ -462,6 +468,20 @@ pixi run lerobot-record \
 ```
 
 This picks up from the last episode number instead of starting over.
+
+### Starting fresh (deleting an existing dataset)
+
+If you want to discard all previously recorded episodes and start over from episode 0, delete the dataset directory for the specific `repo_id` you are using:
+
+```bash
+# Delete the SFP dataset and start over
+rm -rf /scratch2/atang/ws_aic/teleop-dataset/atang/aic_sfp_demos
+
+# Delete the SC dataset and start over
+rm -rf /scratch2/atang/ws_aic/teleop-dataset/atang/aic_sc_demos
+```
+
+After deleting, run the recording command from Section 1 **without** `--resume=true` — it will create a fresh dataset from scratch.
 
 ### The Rerun viewer window
 

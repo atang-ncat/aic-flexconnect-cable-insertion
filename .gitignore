@@ -21,6 +21,9 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Teleop dataset (recorded demos — too large for git)
+teleop-dataset/
+
 # Rosbags (too large for git)
 *.db3
 *.mcap
