@@ -24,9 +24,13 @@ Based on `qualification_phase.md` and `sample_config.yaml`, the eval randomizes:
 
 ---
 
-## Base Command Template
+## Quick-Start: Recording Workflow
 
-All configs follow this pattern. Replace `<CONFIG_PARAMS>` with the lines from each config below.
+For full details see [`teleop_guide.md`](teleop_guide.md). The essentials are below.
+
+### Terminal 1 — Launch the scene
+
+Replace `<CONFIG_PARAMS>` with the parameters from each config section below.
 
 ```bash
 source ~/lab/ws_aic/setup_dev.sh
@@ -37,6 +41,53 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
   cable_type:=sfp_sc_cable \
   <CONFIG_PARAMS>
 ```
+
+### Terminal 2 — Record episodes
+
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic/
+pixi run lerobot-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_keyboard_ee --teleop.id=aic \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --dataset.repo_id=atang/aic_sfp_demos \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset/sfp \
+  --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
+  --dataset.push_to_hub=false \
+  --dataset.private=true \
+  --play_sounds=false \
+  --display_data=true \
+  --resume=true
+```
+
+> **First time only:** remove `--resume=true` to create the dataset. Every session after, keep it.
+
+### Terminal 3 (optional) — Monitor insertion & force
+
+```bash
+ros2 topic echo /scoring/insertion_event
+```
+
+```bash
+source /ws_aic/install/setup.bash
+python3 /run/host/scratch2/atang/ws_aic/scripts/force_monitor.py
+```
+
+### Keyboard controls (essentials)
+
+| Key | Action |
+|-----|--------|
+| `W/S` | Move forward / backward (X) |
+| `A/D` | Move left / right (Y) |
+| `Q/E` | Move up / down (Z) |
+| `I/K` | Rotate pitch |
+| `J/L` | Rotate yaw |
+| `U/O` | Rotate roll |
+| `Right Arrow` | **Save episode** and start next |
+| `Backspace` | Discard current episode |
+| `Escape` | Stop recording and exit |
+| `1` | Switch to low-speed mode (fine insertion) |
+| `2` | Switch to high-speed mode (approach) |
 
 ---
 
