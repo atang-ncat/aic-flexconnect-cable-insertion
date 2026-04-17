@@ -388,82 +388,6 @@ class AutoCollectNode(Node):
     def stop_robot(self):
         self.send_velocity([0, 0, 0], [0, 0, 0])
 
-    def settle_cable(self, plug_frame, lift_m=0.15, ramp_s=2.0, hold_s=2.0, fps=30):
-        """Slowly lift the gripper, hold, and sample the plug->gripper offset.
-
-        Why this exists
-        ---------------
-        ``compute_target_pose`` computes ``target_gripper = target_plug +
-        (gripper_current - plug_current)`` every tick. With a rigid cable
-        that's exact; with a *flexible* cable, the offset changes as the
-        cable bends. Recomputing it every tick turns the control loop into
-        a positive-feedback drift: when the plug gets stuck, the target
-        wanders with the gripper instead of staying fixed. So the arm
-        descends 6 cm while the distance to target stays stuck at 10 cm
-        (see the Apr-17 03:14 attempt-1 trace).
-
-        Fix: measure the offset ONCE with the cable dangling straight under
-        gravity, then freeze it for the whole episode. This routine runs
-        before each attempt to produce that reference offset.
-
-        Returns
-        -------
-        plug_to_gripper_ref : np.ndarray shape (3,) in base_link frame,
-            or ``None`` if TF was unavailable during sampling.
-        diag : dict with keys 'length_m', 'lateral_m', 'z_m' describing
-            the settled geometry (useful for the pre-flight reject check).
-        """
-        try:
-            start_pos, start_quat = self.get_tcp_pose()
-        except Exception:
-            logger.warning("  settle_cable: TCP pose unavailable")
-            return None, {}
-
-        top_pos = start_pos + np.array([0.0, 0.0, lift_m])
-
-        ramp_steps = max(2, int(ramp_s * fps))
-        for i in range(ramp_steps):
-            alpha = (i + 1) / ramp_steps
-            cmd_pos = (1.0 - alpha) * start_pos + alpha * top_pos
-            self.send_pose_target(cmd_pos, start_quat)
-            time.sleep(1.0 / fps)
-
-        hold_steps = max(1, int(hold_s * fps))
-        for _ in range(hold_steps):
-            self.send_pose_target(top_pos, start_quat)
-            time.sleep(1.0 / fps)
-
-        # Sample offset after the hold. Average a few ticks to de-noise.
-        samples = []
-        for _ in range(max(3, int(0.3 * fps))):
-            try:
-                gripper_tf = self.lookup_tf("base_link", "gripper/tcp")
-                plug_tf = self.lookup_tf("base_link", plug_frame)
-                g = np.array([gripper_tf.transform.translation.x,
-                              gripper_tf.transform.translation.y,
-                              gripper_tf.transform.translation.z])
-                p = np.array([plug_tf.transform.translation.x,
-                              plug_tf.transform.translation.y,
-                              plug_tf.transform.translation.z])
-                samples.append(g - p)
-            except TransformException:
-                pass
-            time.sleep(1.0 / fps)
-
-        if not samples:
-            logger.warning("  settle_cable: no TF samples collected")
-            return None, {}
-
-        offset = np.mean(np.stack(samples, axis=0), axis=0)
-        length = float(np.linalg.norm(offset))
-        lateral = float(np.linalg.norm(offset[:2]))
-        diag = {"length_m": length, "lateral_m": lateral, "z_m": float(offset[2])}
-        logger.info(
-            f"  Cable settled: length={length*100:.1f}cm "
-            f"lateral={lateral*100:.1f}cm z={offset[2]*100:+.1f}cm"
-        )
-        return offset, diag
-
     def retreat_vertical(self, lift_m=0.15, duration_s=2.5, fps=30):
         """Smoothly lift the TCP straight up by `lift_m` in base_link Z+.
 
@@ -743,9 +667,6 @@ def compute_target_pose(
     p_gain_lateral: float = 0.05,
     i_gain_lateral: float = 0.15,
     reset_integrator: bool = False,
-    lateral_noise_port_frame=None,
-    yaw_noise: float = 0.0,
-    plug_to_gripper_override=None,
 ):
     """
     Compute gripper target pose that aligns plug with port,
@@ -754,30 +675,6 @@ def compute_target_pose(
     If `integrator` is provided, applies CheatCode-style P+I correction on
     the plug's lateral (port-local XY) error. This is needed for reliable
     descent — without it, steady-state lateral offset causes insertion to jam.
-
-    If `lateral_noise_port_frame` is a 2-tuple ``(du, dv)`` in meters, the
-    final target is displaced by that offset expressed in the port's local
-    XY plane (u = port's local X axis, v = port's local Y axis). Use this
-    to synthesize "naturally imperfect" demonstrations — the P+I integrator
-    will still succeed (noise is small enough to fit the port's tolerance)
-    but the recorded velocity actions will contain micro-corrections that
-    clean expert demos lack.
-
-    If `yaw_noise` (radians) is non-zero, applies an additional rotation
-    around the port's insertion axis on top of the computed target quat.
-    Small values (|y| < 0.05 rad ~ 3°) look like imperfect wrist alignment
-    but don't break insertion.
-
-    ``plug_to_gripper_override`` (np.ndarray shape (3,)) forces a
-    specific plug->gripper offset to be used when converting from
-    target_plug_pos to target_gripper_pos. Without it (the default and
-    what ``run_episode`` uses now), the offset is recomputed from the
-    LIVE plug position every tick — same as ``CheatCode``. Historical
-    note: passing a frozen value captured before Approach looks
-    appealing but breaks down once the gripper rotates to align the
-    plug with the port, since the captured offset is in the world frame
-    and reflects the pre-rotation geometry. Kept as a hook for
-    experimentation; leave it ``None`` for production runs.
     """
     port_tf = node.lookup_tf("base_link", port_frame)
     plug_tf = node.lookup_tf("base_link", plug_frame)
@@ -810,10 +707,7 @@ def compute_target_pose(
     insertion_axis = R_port[:, 2]   # port local Z = approach direction
     lateral_u = R_port[:, 0]        # port local X
     lateral_v = R_port[:, 1]        # port local Y
-    if plug_to_gripper_override is not None:
-        plug_to_gripper = np.asarray(plug_to_gripper_override, dtype=float)
-    else:
-        plug_to_gripper = gripper_pos - plug_pos
+    plug_to_gripper = gripper_pos - plug_pos
 
     # Lateral P+I correction (CheatCode parity)
     lateral_correction = np.zeros(3)
@@ -831,25 +725,10 @@ def compute_target_pose(
         )
 
     target_plug_pos = port_pos + insertion_axis * z_offset + lateral_correction
-
-    # Per-episode noise injected at the final target only; the integrator
-    # error signal above still uses the true port<->plug positions so the
-    # controller continues to converge correctly, but the commanded pose
-    # (and therefore the recorded velocity action) is perturbed.
-    if lateral_noise_port_frame is not None:
-        du, dv = lateral_noise_port_frame
-        target_plug_pos = target_plug_pos + lateral_u * float(du) + lateral_v * float(dv)
-
     target_gripper_pos = target_plug_pos + plug_to_gripper
 
     q_diff = quat_multiply(q_port, quat_conjugate(q_plug))
     q_gripper_target = quat_multiply(q_diff, q_gripper)
-
-    if yaw_noise != 0.0:
-        half = 0.5 * float(yaw_noise)
-        c, s = math.cos(half), math.sin(half)
-        q_yaw = (c, s * insertion_axis[0], s * insertion_axis[1], s * insertion_axis[2])
-        q_gripper_target = quat_multiply(q_yaw, q_gripper_target)
 
     return target_gripper_pos, q_gripper_target
 
@@ -992,76 +871,8 @@ class EpisodeResult:
     duration: float = 0.0
 
 
-def _sample_noise_profile(rng, scale=1.0):
-    """Sample per-episode target-pose noise.
-
-    Ranges were chosen empirically:
-      * Approach: large enough that each episode visibly lands at a
-        different hover spot (±1 cm XY, ±2°). The integrator is disabled
-        during approach, so the noise persists until fine-align reaches it.
-      * Fine align: ±3 mm XY, ±1°. Inside the integrator's envelope so
-        the P+I correction will null it out over ~4 s — exactly the kind
-        of micro-correction signal the policy should learn.
-      * Insertion: ±1 mm XY. Inside the port's mechanical tolerance so
-        insertion still succeeds, but the descent trajectory shows small
-        non-zero lateral actions.
-      * Hold: 0. Clean seating for the final frames.
-
-    ``scale`` linearly multiplies every range; 0 disables noise entirely.
-    """
-    s = float(max(0.0, scale))
-
-    def u(lo, hi):
-        return float(rng.uniform(lo, hi)) * s
-
-    return {
-        "approach": np.array([u(-0.010, 0.010), u(-0.010, 0.010)]),
-        "approach_yaw": u(-math.radians(2.0), math.radians(2.0)),
-        "align":    np.array([u(-0.003, 0.003), u(-0.003, 0.003)]),
-        "align_yaw": u(-math.radians(1.0), math.radians(1.0)),
-        "insert":   np.array([u(-0.001, 0.001), u(-0.001, 0.001)]),
-    }
-
-
-def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
-                noise_scale: float = 1.0, rng: "np.random.Generator | None" = None,
-                settle_lift_m: float = 0.15, settle_lateral_abort_m: float = 0.04,
-                cable_settle_enabled: bool = True):
-    """Execute one insertion episode with full safety monitoring.
-
-    Motion shape mirrors ``CheatCode.insert_cable()``:
-
-      1. **Approach** (~5 s): smoothly interpolate both position_fraction
-         and slerp_fraction from 0 → 1 so the gripper blends from its
-         current pose to ``port + 0.20 m * insertion_axis`` with the
-         plug's orientation matched to the port's. The integrator is
-         held at zero.
-      2. **Descent** (~21.5 s): continuously ramp ``z_offset`` from
-         ``0.20`` → ``-0.015`` at ~0.01 m/s. The lateral integrator is
-         active so any steady-state offset between plug-tip and port is
-         worked out during the descent. Uses the LIVE plug→gripper
-         vector every tick (same as CheatCode).
-      3. **Hold** (~5 s): no new motion commands; the impedance
-         controller settles at the last target. Insertion events are
-         typically received here.
-
-    ``noise_scale`` (0.0 disables) multiplies the per-episode target-pose
-    perturbations. See ``_sample_noise_profile`` for the sampling ranges.
-
-    ``cable_settle_enabled`` (default True) runs a short cable-settle
-    ramp before Approach purely for observability + pre-flight reject —
-    the measured offset is NOT fed back into ``compute_target_pose``.
-    Freezing the offset sounded good in theory (see earlier iterations)
-    but it assumes a rigid cable, which breaks the moment the gripper
-    rotates to align the plug with the port. CheatCode uses the live
-    offset and the slow continuous descent keeps it well-behaved.
-
-    ``settle_lateral_abort_m`` — after settling, if the lateral component
-    of the measured plug->gripper vector exceeds this (default 4 cm) the
-    attempt is aborted immediately with ``cable_bent_on_settle``. That
-    saves the ~30 s we'd otherwise spend slamming a bent cable sideways
-    into the board. Set ``0`` to disable the pre-flight reject.
-    """
+def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
+    """Execute one insertion episode with full safety monitoring."""
     node.reset_episode_monitors()
     result = EpisodeResult()
     t0 = time.monotonic()
@@ -1072,54 +883,6 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
     stuck_samples: list = []
     # CheatCode-style lateral integrator (shared across phases for one episode)
     lateral_integrator = LateralIntegrator()
-
-    # Per-episode noise profile (sampled once, held constant for each phase).
-    # The integrator still drives toward the true port, but the commanded
-    # target is slightly offset — producing natural-looking micro-corrections
-    # in the recorded actions without compromising insertion success.
-    if rng is None:
-        rng = np.random.default_rng()
-    noise = _sample_noise_profile(rng, scale=noise_scale)
-    if noise_scale > 0:
-        logger.info(
-            f"  Noise profile (scale={noise_scale:.2f}):  "
-            f"approach dXY=({noise['approach'][0]*1000:+.1f},"
-            f"{noise['approach'][1]*1000:+.1f})mm "
-            f"dyaw={math.degrees(noise['approach_yaw']):+.2f}deg  |  "
-            f"insert dXY=({noise['insert'][0]*1000:+.1f},"
-            f"{noise['insert'][1]*1000:+.1f})mm"
-        )
-
-    # Pre-flight: briefly lift the gripper so the cable can dangle straight.
-    # This is a diagnostic + pre-flight reject only — the measured offset is
-    # NOT fed back into compute_target_pose (that caused the "commanded
-    # target 10 cm off from actual" drift we hit last iteration). Live
-    # plug->gripper inside compute_target_pose combined with CheatCode's
-    # slow continuous descent is the proven working path.
-    if cable_settle_enabled:
-        _settled_offset, settle_diag = node.settle_cable(
-            plug_frame=plug_frame, lift_m=settle_lift_m, fps=fps
-        )
-        if _settled_offset is None:
-            result.aborted = True
-            result.abort_reason = "settle_cable_failed (no TF)"
-            result.duration = time.monotonic() - t0
-            return result
-        if (
-            settle_lateral_abort_m > 0
-            and settle_diag.get("lateral_m", 0.0) > settle_lateral_abort_m
-        ):
-            logger.warning(
-                f"  Cable still bent after settle: lateral="
-                f"{settle_diag['lateral_m']*100:.1f}cm > "
-                f"{settle_lateral_abort_m*100:.1f}cm — aborting attempt early."
-            )
-            result.aborted = True
-            result.abort_reason = (
-                f"cable_bent_on_settle ({settle_diag['lateral_m']*100:.1f}cm lateral)"
-            )
-            result.duration = time.monotonic() - t0
-            return result
 
     def step(action_dict, target_pos=None, target_quat_wxyz=None):
         """Record one frame; drive robot by POSE target (MODE_POSITION).
@@ -1166,152 +929,147 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
                 )
         return None
 
-    def run_abort_check():
-        reason = check_abort()
-        if reason:
-            result.aborted = True
-            result.abort_reason = reason
-            result.duration = time.monotonic() - t0
-            node.stop_robot()
-            return True
-        return False
+    def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False,
+                  use_integrator=False, reset_integrator_first=False,
+                  interpolate_from_current=False, interpolate_steps=None):
+        """Run a control phase. Returns True if should continue, False if aborted/done.
 
-    approach_noise = tuple(noise["approach"])
-    approach_yaw_noise = float(noise["approach_yaw"])
-    insert_noise = tuple(noise["insert"])
-
-    # ------------------------------------------------------------------
-    # Phase 1: Approach (CheatCode parity)
-    # ------------------------------------------------------------------
-    # 5 seconds. Smoothly interpolate both position_fraction (linear blend
-    # between current gripper pose and computed target) and slerp_fraction
-    # (orientation blend) from 0 -> 1. z_offset is held at 0.20 so the
-    # gripper ends 20 cm above the port with plenty of room for the cable
-    # to dangle freely, matching CheatCode's starting condition.
-    # Integrator stays at zero throughout (reset every tick).
-    approach_gains = ControllerGains(
-        kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3,
-    )
-    approach_z_offset = 0.20
-    approach_duration = 5.0
-    approach_steps = max(1, int(approach_duration * fps))
-    start_pos, start_quat = node.get_tcp_pose()
-    try:
-        tp_end, _ = compute_target_pose(
-            node, port_frame, plug_frame, z_offset=approach_z_offset,
-        )
-        logger.info(
-            f"  Phase: Approach  (z_offset=+{approach_z_offset*100:.0f}cm, "
-            f"initial dist-to-target = "
-            f"{np.linalg.norm(tp_end - start_pos)*100:.1f} cm, "
-            f"duration {approach_duration:.1f}s)"
-        )
-    except TransformException:
-        logger.info(f"  Phase: Approach  (duration {approach_duration:.1f}s)")
-
-    for i in range(approach_steps):
-        if node.insertion_detected.is_set():
-            break
-        if run_abort_check():
-            return result
-        frac = (i + 1) / approach_steps
+        If `interpolate_from_current` is True, the FIRST `interpolate_steps`
+        ticks (default: all of max_steps) send a linearly interpolated pose
+        target going from the current TCP pose to the final computed target.
+        This avoids the impedance controller snapping to a distant target and
+        slamming into obstacles.
+        """
         try:
-            target_pos, target_quat = compute_target_pose(
-                node, port_frame, plug_frame, z_offset=approach_z_offset,
-                integrator=lateral_integrator, reset_integrator=True,
-                lateral_noise_port_frame=approach_noise,
-                yaw_noise=approach_yaw_noise,
+            tp, _ = compute_target_pose(node, port_frame, plug_frame, z_offset=z_start)
+            cp, _ = node.get_tcp_pose()
+            logger.info(
+                f"  Phase: {name}  (initial dist-to-target = "
+                f"{np.linalg.norm(tp - cp)*100:.1f} cm)"
             )
-            cmd_pos = (1.0 - frac) * start_pos + frac * target_pos
-            cmd_quat = quat_nlerp(start_quat, target_quat, frac)
-            cur_pos, cur_quat = node.get_tcp_pose()
-            action, _ = compute_velocity_action(
-                cur_pos, cur_quat, target_pos, target_quat,
-                approach_gains, insertion_phase=False,
-            )
-            step(action, target_pos=cmd_pos, target_quat_wxyz=cmd_quat)
-        except TransformException as e:
-            logger.warning(f"    TF failed: {e}")
-            step(ZERO_ACTION)
-        time.sleep(1.0 / fps)
+        except TransformException:
+            logger.info(f"  Phase: {name}")
+        if z_start == z_end:
+            z_values = [z_start] * max_steps
+        else:
+            z_values = np.linspace(z_start, z_end, num=max_steps)
 
-    # ------------------------------------------------------------------
-    # Phase 2: Descent (CheatCode parity)
-    # ------------------------------------------------------------------
-    # Continuously ramp z_offset 0.20 -> -0.015 at ~0.01 m/s (~21.5 s
-    # total). Integrator is active and accumulates lateral error in the
-    # port's local frame. LIVE plug->gripper every tick (inside
-    # compute_target_pose) — the slow continuous motion keeps the cable
-    # dynamics well-behaved, so no freezing needed.
-    descent_gains = ControllerGains(
-        kp_linear=2.0, max_linear_vel=0.02, insertion_linear_vel=0.01,
+        # Snapshot of the TCP pose at the START of the phase, used only for
+        # the optional interpolation ramp.
+        if interpolate_from_current:
+            start_pos, start_quat = node.get_tcp_pose()
+            ramp_steps = interpolate_steps if interpolate_steps else max_steps
+
+        for i, z in enumerate(z_values):
+            if node.insertion_detected.is_set():
+                return True
+
+            reason = check_abort()
+            if reason:
+                result.aborted = True
+                result.abort_reason = reason
+                return False
+
+            try:
+                target_pos, target_quat = compute_target_pose(
+                    node, port_frame, plug_frame, z_offset=z,
+                    integrator=lateral_integrator if use_integrator else None,
+                    reset_integrator=(reset_integrator_first and i == 0),
+                )
+                cur_pos, cur_quat = node.get_tcp_pose()
+                action, dist = compute_velocity_action(
+                    cur_pos, cur_quat, target_pos, target_quat, gains, insertion_phase=is_insertion
+                )
+
+                if interpolate_from_current and i < ramp_steps:
+                    alpha = (i + 1) / ramp_steps
+                    cmd_pos = (1.0 - alpha) * start_pos + alpha * target_pos
+                    cmd_quat = quat_nlerp(start_quat, target_quat, alpha)
+                else:
+                    cmd_pos, cmd_quat = target_pos, target_quat
+                step(action, target_pos=cmd_pos, target_quat_wxyz=cmd_quat)
+
+                # Log force periodically during insertion phase
+                if is_insertion and i % (fps * 2) == 0:
+                    fs = node.get_force_stats()
+                    logger.info(f"    z={z:.4f} dist={dist:.4f}m force={fs['current']:.1f}N "
+                                f"(max={fs['max']:.1f}N)")
+
+                # Early convergence for approach/alignment phases
+                if not is_insertion and dist < 0.003:
+                    logger.info(f"    Converged (dist={dist:.4f}m)")
+                    break
+
+            except TransformException as e:
+                logger.warning(f"    TF failed: {e}")
+                step(ZERO_ACTION)
+
+            time.sleep(1.0 / fps)
+        return True
+
+    # Phase 1: Approach — move above port.
+    # CheatCode-style smooth interpolation from the CURRENT TCP pose to the
+    # above-port target over the full phase (~8s at 30Hz). This handles both
+    # the first-attempt startup (arm may be ~25cm from target) and recovery
+    # from earlier attempts (arm may be jammed against the board).
+    approach_gains = ControllerGains(kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3)
+    approach_steps = fps * 8
+    if not run_phase("Approach", z_start=0.12, z_end=0.12, gains=approach_gains,
+                     max_steps=approach_steps, use_integrator=False,
+                     interpolate_from_current=True,
+                     interpolate_steps=int(approach_steps * 0.75)):
+        node.stop_robot()
+        result.duration = time.monotonic() - t0
+        return result
+
+    # Phase 2: Fine alignment — lower and correct lateral offset (I-gain on from here)
+    fine_gains = ControllerGains(kp_linear=2.0, max_linear_vel=0.02, kp_angular=2.5, max_angular_vel=0.2)
+    if not run_phase("Fine align", z_start=0.06, z_end=0.06, gains=fine_gains,
+                     max_steps=fps * 4, use_integrator=True, reset_integrator_first=True):
+        node.stop_robot()
+        result.duration = time.monotonic() - t0
+        return result
+
+    # Phase 3: Insertion descent — slow, force-aware, integrator still active
+    insert_gains = ControllerGains(
+        kp_linear=2.0, max_linear_vel=0.01, insertion_linear_vel=0.008,
         kp_angular=2.5, max_angular_vel=0.15,
     )
-    descent_z_start = 0.20
-    descent_z_end = -0.015
-    descent_speed = 0.01   # m/s
-    descent_distance = descent_z_start - descent_z_end
-    descent_duration = descent_distance / descent_speed
-    descent_steps = max(1, int(descent_duration * fps))
-    logger.info(
-        f"  Phase: Descent  (z_offset {descent_z_start*100:+.0f} -> "
-        f"{descent_z_end*100:+.1f} cm, {descent_duration:.1f}s at "
-        f"{descent_speed*1000:.0f} mm/s)"
-    )
-    for i in range(descent_steps):
-        if node.insertion_detected.is_set():
-            break
-        if run_abort_check():
-            return result
-        frac = i / max(1, descent_steps - 1)
-        z = descent_z_start - descent_distance * frac
-        try:
-            target_pos, target_quat = compute_target_pose(
-                node, port_frame, plug_frame, z_offset=z,
-                integrator=lateral_integrator, reset_integrator=False,
-                lateral_noise_port_frame=insert_noise,
-                yaw_noise=0.0,
-            )
-            cur_pos, cur_quat = node.get_tcp_pose()
-            action, dist = compute_velocity_action(
-                cur_pos, cur_quat, target_pos, target_quat,
-                descent_gains, insertion_phase=True,
-            )
-            step(action, target_pos=target_pos, target_quat_wxyz=target_quat)
-            if i % (fps * 2) == 0:
-                fs = node.get_force_stats()
-                logger.info(
-                    f"    z={z:+.4f} dist={dist:.4f}m "
-                    f"force={fs['current']:.1f}N (max={fs['max']:.1f}N) "
-                    f"intX={lateral_integrator.x*1000:+.1f}mm "
-                    f"intY={lateral_integrator.y*1000:+.1f}mm"
-                )
-        except TransformException as e:
-            logger.warning(f"    TF failed: {e}")
-            step(ZERO_ACTION)
-        time.sleep(1.0 / fps)
+    if not run_phase("Insertion", z_start=0.06, z_end=-0.015, gains=insert_gains,
+                     max_steps=fps * 12, is_insertion=True, use_integrator=True):
+        node.stop_robot()
+        result.duration = time.monotonic() - t0
+        return result
 
-    # ------------------------------------------------------------------
-    # Phase 3: Hold (CheatCode parity)
-    # ------------------------------------------------------------------
-    # CheatCode just sleeps for 5 s after the descent — no new motion
-    # commands. The impedance controller holds the last commanded target
-    # (z_offset = -0.015) and the insertion event typically fires here as
-    # the plug fully seats. We also keep a TF-based fallback for when
-    # the gz_ros_bridge misses the event message.
-    logger.info("  Phase: Hold (waiting for insertion event)")
-    hold_seconds = 5.0
+    # Phase 4: Hold — keep pressing at insertion depth and wait for either
+    # the /scoring/insertion_event message (gold standard) OR a TF-based
+    # check that the plug tip has seated into the port (fallback that works
+    # even if the lazy gz_ros_bridge drops the event).
+    #
+    # Hold duration is deliberately long (~8s) because the cable has
+    # noticeable settling dynamics: plug may need a moment to fully seat.
+    logger.info("  Phase: Hold (keeping insertion pressure)")
+    hold_seconds = 8.0
     tf_success = False
-    tf_success_streak = 0
+    tf_success_streak = 0  # require a few consecutive matches to avoid flicker
     hold_start = time.monotonic()
     while time.monotonic() - hold_start < hold_seconds:
         if node.insertion_detected.is_set():
             break
-        if run_abort_check():
-            return result
-        # Record frames + emit ZERO velocity action. Intentionally do not
-        # send a new pose target — let the impedance controller settle.
-        step(ZERO_ACTION)
+
+        # Keep pressing: recompute the same "slightly below port face" target
+        # each tick so the controller maintains insertion force.
+        try:
+            tp, tq = compute_target_pose(
+                node, port_frame, plug_frame, z_offset=-0.015,
+                integrator=lateral_integrator, reset_integrator=False,
+            )
+            step(ZERO_ACTION, target_pos=tp, target_quat_wxyz=tq)
+        except TransformException:
+            step(ZERO_ACTION)
+
+        # TF-based success: plug is at port (<=1cm total, <=5mm lateral) and
+        # it's there for >=0.5s.
         try:
             total, axial, lateral = node.plug_to_port_distance(port_frame, plug_frame)
             if total < 0.01 and lateral < 0.005:
@@ -1327,12 +1085,14 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
                 tf_success_streak = 0
         except TransformException:
             pass
+
         time.sleep(1.0 / fps)
 
-    # DON'T call stop_robot(): keep the last target in place until the
-    # caller explicitly retreats, so the impedance controller can't drift
-    # and pull a freshly seated plug back out.
+    # DON'T call stop_robot(): keep the insertion-pressure target in place
+    # until the caller explicitly retreats. Otherwise the impedance controller
+    # could drift and pull the cable back out.
 
+    # Collect results
     result.success = node.insertion_detected.is_set() or tf_success
     if tf_success and not node.insertion_detected.is_set():
         logger.info("  (insertion confirmed by TF; /scoring/insertion_event not received)")
@@ -1364,43 +1124,6 @@ def main():
     ap.add_argument("--max-episode-time", type=float, default=60.0, help="Max seconds per attempt")
     ap.add_argument("--discard-high-force", action="store_true",
                     help="Discard episodes where force exceeded scoring threshold for >1s")
-    ap.add_argument(
-        "--noise-scale", type=float, default=1.0,
-        help=(
-            "Scale factor for per-episode target-pose noise (default 1.0). "
-            "Injects small XY + yaw offsets to the commanded target so "
-            "each episode takes a subtly different approach and the P+I "
-            "integrator produces natural micro-corrections. Approach: "
-            "±1 cm XY, ±2° yaw. Insertion: ±1 mm XY. Pass 0 to disable."
-        ),
-    )
-    ap.add_argument(
-        "--seed", type=int, default=None,
-        help="Optional RNG seed for reproducible noise profiles.",
-    )
-    ap.add_argument(
-        "--no-settle", action="store_true",
-        help=(
-            "Skip the pre-approach cable-settle step entirely. The settle "
-            "step lifts the gripper ~15 cm so the cable can dangle "
-            "straight, logs a diagnostic, and can early-abort a bent "
-            "attempt. It's kept ON by default (costs ~4 s) because "
-            "starting from a consistent cable pose helps the first "
-            "approach."
-        ),
-    )
-    ap.add_argument(
-        "--settle-lift-m", type=float, default=0.15,
-        help="Meters to lift the gripper during the cable-settle ramp (default 0.15).",
-    )
-    ap.add_argument(
-        "--settle-lateral-abort-m", type=float, default=0.04,
-        help=(
-            "If the settled plug->gripper vector has a lateral magnitude "
-            "above this many meters, abort the attempt early as "
-            "'cable_bent_on_settle' (default 0.04). Pass 0 to disable."
-        ),
-    )
     ap.add_argument(
         "--reset-scene", action="store_true",
         help=(
@@ -1477,9 +1200,6 @@ def main():
     discarded_collision = 0
     discarded_stuck = 0
     discarded_failed = 0
-    discarded_bent = 0
-
-    rng = np.random.default_rng(args.seed)
 
     logger.info(f"=== Starting collection: {args.num_episodes} episodes, max {args.max_attempts} attempts ===")
 
@@ -1503,11 +1223,6 @@ def main():
                 plug_frame=args.plug_frame,
                 fps=args.fps,
                 max_time=args.max_episode_time,
-                noise_scale=args.noise_scale,
-                rng=rng,
-                settle_lift_m=args.settle_lift_m,
-                settle_lateral_abort_m=args.settle_lateral_abort_m,
-                cable_settle_enabled=not args.no_settle,
             )
 
             # Decision: save or discard
@@ -1519,8 +1234,6 @@ def main():
                     discarded_collision += 1
                 elif "stuck" in reason:
                     discarded_stuck += 1
-                elif "bent" in reason:
-                    discarded_bent += 1
 
             elif not ep.success:
                 logger.info(f"  FAILED: no insertion detected ({ep.duration:.1f}s)")
@@ -1587,7 +1300,6 @@ def main():
         logger.info(f"    High force:        {discarded_force}")
         logger.info(f"    Collision:         {discarded_collision}")
         logger.info(f"    Robot stuck:       {discarded_stuck}")
-        logger.info(f"    Cable bent:        {discarded_bent}")
         logger.info(f"{'='*60}")
 
         dataset.finalize()

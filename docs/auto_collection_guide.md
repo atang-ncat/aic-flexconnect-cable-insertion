@@ -29,22 +29,14 @@ Plug position (from /tf)  ───►  orientation alignment        ──►  
 
 ### Insertion Phases
 
-Each episode runs through 3 phases that mirror `CheatCode.insert_cable()`
-(the proven-working expert policy in `aic_example_policies`):
+Each episode runs through 4 phases mimicking human teleoperation:
 
 | Phase | Duration | Speed | What happens |
 |-------|----------|-------|-------------|
-| **1. Approach** | ~5 s | — | Smoothly blend gripper pose from current to **20 cm above port**. Both position_fraction and slerp_fraction ramp 0→1 over the phase. Integrator held at 0. |
-| **2. Descent** | ~21.5 s | 0.01 m/s | One continuous ramp of `z_offset` from **+0.20 m → −0.015 m** along the port's insertion axis. Lateral P+I integrator is active the whole time; live `plug_to_gripper` is recomputed each tick. |
-| **3. Hold** | ~5 s | 0 m/s | No new motion commands — impedance controller settles at the last target. Wait for `/scoring/insertion_event` or a TF-based seat check. |
-
-> **Earlier iterations** used a 4-phase split with a separate Fine Align at
-> z=6 cm and a shorter Insertion at 0.008 m/s, plus a "frozen plug-offset"
-> to fight cable bending. That was strictly worse — pausing at z=6 cm let
-> the plug start pressing against the board surface while the integrator
-> thrashed, and the frozen offset assumed a rigid cable which breaks the
-> moment the gripper rotates. Matching CheatCode's continuous slow
-> descent end-to-end is the clean solution.
+| **1. Approach** | ~8s | 0.04 m/s | Move above the port, align orientation |
+| **2. Fine align** | ~4s | 0.02 m/s | Lower closer, correct lateral errors |
+| **3. Insert** | ~12s | 0.008 m/s | Slow descent along insertion axis |
+| **4. Hold** | ~3s | 0 m/s | Wait for insertion event confirmation |
 
 ### Episode Discard Conditions
 
@@ -160,111 +152,7 @@ rm -rf /scratch2/atang/ws_aic/teleop-automated-dataset/sfp_test
 | `--max-episode-time` | 60.0 | Max seconds per attempt |
 | `--discard-high-force` | false | Discard episodes where force > 20 N for > 1s |
 | `--exit-on-success` | false | Stop as soon as one episode is saved. Recommended for the per-launch workflow below. |
-| `--noise-scale` | 1.0 | Scales per-episode target-pose noise. See [Target-pose noise](#target-pose-noise). Pass `0` to disable. |
-| `--seed` | (none) | Optional RNG seed for reproducible noise profiles. |
-| `--no-settle` | false | Skip the pre-approach cable-settle step entirely. See [Cable-settle](#cable-settle-observability--pre-flight-reject). |
-| `--settle-lift-m` | 0.15 | How far the gripper lifts during the cable-settle ramp. |
-| `--settle-lateral-abort-m` | 0.04 | Abort the attempt early if the settled plug→gripper vector has a lateral component larger than this (meters). `0` disables the check. |
 | `--reset-scene` | false | **No-op / broken.** Calling `/gz_server/reset_simulation` on this build crashes the `ros_gz_container` (ros2_control reloads inside the same process and segfaults). Flag is accepted for backward compatibility only. |
-
-## Target-pose noise
-
-Without any noise, the CheatCode expert produces trajectories that are nearly
-identical episode-to-episode: the plug descends in a clean straight line with
-minimal lateral action. That's mechanically perfect but makes the resulting
-dataset *too sterile* — a policy trained only on these clean runs has never
-seen a micro-correction and gets brittle when it ends up in a state slightly
-off the demonstrated trajectory.
-
-`--noise-scale` (default **1.0**) injects small per-phase perturbations into
-the commanded target pose. Each episode samples one offset per phase, holds
-it constant through that phase, and logs the values at the start of the
-attempt. The lateral P+I integrator still references the **true** port
-position, so it naturally corrects against the biased target — producing
-realistic micro-corrections in the recorded velocity actions.
-
-Ranges at `--noise-scale 1.0`:
-
-| Phase | Lateral XY | Yaw (around insertion axis) |
-|-------|------------|-----------------------------|
-| Approach | ±10 mm | ±2° |
-| Descent  | ±1 mm  | 0 |
-| Hold     | 0      | 0 |
-
-(The internal noise profile still carries an "align" field for backwards
-compatibility, but it is no longer applied — the 3-phase motion only
-consumes `approach` and `insert`.)
-
-Values are small enough that insertion still succeeds (well within the port's
-mechanical tolerance), but large enough that each trajectory looks subtly
-different and the recorded `linear.x / linear.y / angular.z` actions have
-visible variance instead of being dead-zero most of the time.
-
-Pass `--noise-scale 0` to reproduce the old deterministic behavior (useful for
-debugging). Pass `--seed 42` along with it to get a reproducible profile
-across identical configs.
-
-## Cable-settle (observability + pre-flight reject)
-
-### Why the script still has a settle step
-
-Earlier iterations **froze** the settled `plug_to_gripper` offset and fed
-it to `compute_target_pose` for the rest of the episode, assuming that
-would stop the flexible cable from moving the target around. That made
-things *worse*: freezing assumes a rigid cable, and the gripper has to
-rotate ~90° during Approach to align the plug with a horizontal SFP
-port. A world-frame offset captured before that rotation doesn't match
-reality after it — the commanded target ends up ~10 cm off from where
-the plug actually is, and the descent just mashes the plug against the
-board surface next to the port.
-
-The proven fix is to match `CheatCode` exactly: use the **live**
-`plug_to_gripper` every tick and make the descent slow and continuous so
-the cable dynamics never have time to get chaotic.
-
-### What the settle step does now
-
-The settle step is kept as a diagnostic + pre-flight reject:
-
-1. Lift the gripper straight up `--settle-lift-m` meters (default 15 cm)
-   over ~2 s, and hold for 2 s so the cable can dangle.
-2. Sample `plug_to_gripper` a handful of times and log its length, z
-   component, and lateral component as a `Cable settled: …` line.
-3. Do **not** feed that offset back into `compute_target_pose` — it's
-   only used for the reject check below.
-
-### Pre-flight reject
-
-If the settled offset's lateral component is above
-`--settle-lateral-abort-m` (default 4 cm), the attempt is aborted
-immediately with reason `cable_bent_on_settle`. This catches the case
-where a previous attempt left the cable jammed sideways: a retry from
-that state was always going to fail, so aborting saves the ~30 s of
-descent we'd otherwise burn.
-
-### Tuning knobs
-
-- `--no-settle` — skip the settle step entirely. Saves ~4 s per
-  attempt; useful if you trust your grasp config and don't care about
-  the diagnostic.
-- `--settle-lift-m 0.20` — lift further if 15 cm isn't enough clearance
-  for the cable to hang straight at your grasp pose.
-- `--settle-lateral-abort-m 0` — accept any cable pose (no pre-flight
-  reject). Useful if your grasp configuration legitimately has a large
-  sideways offset that you know will work itself out during Approach.
-
-### Expected log
-
-The first line of each attempt is now the settle diagnostic:
-
-```
-Cable settled: length=10.3cm lateral=0.6cm z=+10.3cm
-```
-
-`length` is the total plug→gripper distance, `lateral` is the XY
-component (small = cable hanging straight), `z` is vertical (positive =
-gripper above plug, which is what we want). If you see lateral > 4 cm,
-the episode is aborted with `cable_bent_on_settle`.
 
 ## Recommended workflow: one episode per Gazebo launch
 
