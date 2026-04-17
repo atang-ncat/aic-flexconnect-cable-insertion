@@ -23,6 +23,7 @@ Thumbs.db
 
 # Teleop dataset (recorded demos — too large for git)
 teleop-dataset/
+teleop-automated-dataset/
 
 # Rosbags (too large for git)
 *.db3

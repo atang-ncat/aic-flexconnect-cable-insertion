@@ -11,23 +11,52 @@ Architecture:
     - Filters episodes by /scoring/insertion_event success
     - Monitors force and collisions to discard bad episodes
 
-Usage (inside distrobox, with Gazebo + ground_truth:=true running):
+Recommended per-launch workflow (inside distrobox, with Gazebo +
+ground_truth:=true running):
+
     cd /run/host/scratch2/atang/ws_aic/src/aic
+
+    # First launch:
     pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
-        --dataset-root /run/host/scratch2/atang/ws_aic/teleop-dataset/sfp_auto \
+        --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
         --repo-id atang/aic_sfp_auto \
-        --num-episodes 20
+        --num-episodes 1 --max-attempts 5 --exit-on-success
+
+    # Ctrl-C Gazebo, relaunch, then:
+    pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
+        --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
+        --repo-id atang/aic_sfp_auto \
+        --num-episodes 1 --max-attempts 5 --exit-on-success --resume
+
+    # repeat until you have N episodes.
+
+Why per-launch: the scene only spawns one cable, and once it's inserted
+the cable is latched into the port. Trying another attempt in the same
+launch would either pull it back out or wedge the gripper. The
+--reset-scene flag (which was intended to avoid relaunches) is currently
+broken — see the note in main() — so the manual-relaunch loop is the
+supported path.
 
 The dataset it produces can be merged with teleop data for training.
 """
 
 import argparse
 import math
+import os
+import sys
 import time
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock
+
+# Force unbuffered stdout/stderr so log messages appear immediately.
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
 
 import cv2
 import numpy as np
@@ -45,7 +74,7 @@ from aic_control_interfaces.msg import (
     MotionUpdate,
     TrajectoryGenerationMode,
 )
-from geometry_msgs.msg import Twist, Vector3, Wrench, WrenchStamped
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, Vector3, Wrench, WrenchStamped
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
 
@@ -54,6 +83,14 @@ try:
     HAS_CONTACTS_MSG = True
 except ImportError:
     HAS_CONTACTS_MSG = False
+
+try:
+    # Standard ROS2 simulator interface (REP-2014). Used to reset Gazebo
+    # back to its initial state between attempts — avoids relaunching.
+    from simulation_interfaces.srv import ResetSimulation
+    HAS_RESET_SIM_SRV = True
+except ImportError:
+    HAS_RESET_SIM_SRV = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -100,6 +137,21 @@ def quat_to_axis_angle(q_wxyz):
     if w < 0:
         axis = -axis
     return axis, angle
+
+
+def quat_nlerp(q1_wxyz, q2_wxyz, alpha):
+    """Normalized LERP between two quaternions. Good enough for small-to-medium angles."""
+    q1 = np.array(q1_wxyz, dtype=float)
+    q2 = np.array(q2_wxyz, dtype=float)
+    # Ensure shortest-path (dot product >= 0)
+    if float(np.dot(q1, q2)) < 0.0:
+        q2 = -q2
+    q = (1.0 - alpha) * q1 + alpha * q2
+    n = np.linalg.norm(q)
+    if n < 1e-9:
+        return tuple(q1_wxyz)
+    q = q / n
+    return (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
 
 
 def orientation_error_as_angular_vel(q_current_wxyz, q_target_wxyz, gain=2.0, max_vel=0.3):
@@ -178,6 +230,14 @@ class AutoCollectNode(Node):
             MotionUpdate, "/aic_controller/pose_commands", 10,
         )
 
+        # Service client for Gazebo scene reset. Created lazily — only
+        # matters when --reset-scene is used.
+        self._reset_sim_client = None
+        if HAS_RESET_SIM_SRV:
+            self._reset_sim_client = self.create_client(
+                ResetSimulation, "/gz_server/reset_simulation"
+            )
+
     def _controller_state_cb(self, msg):
         self.last_controller_state = msg
         tare = msg.fts_tare_offset.wrench.force
@@ -188,7 +248,10 @@ class AutoCollectNode(Node):
         self.last_joint_states = msg
 
     def _insertion_cb(self, msg):
-        logger.info(f"  [EVENT] Insertion detected: {msg.data}")
+        # Log every message (not just the first) so we can see whether the
+        # `/scoring/insertion_event` bridge is actually firing. Events come
+        # from CablePlugin as e.g. "/nic_card_mount_0/sfp_port_0".
+        logger.info(f"  [EVENT] /scoring/insertion_event: {msg.data}")
         self.insertion_detected.set()
 
     def _collision_cb(self, msg):
@@ -241,7 +304,41 @@ class AutoCollectNode(Node):
     def lookup_tf(self, target, source):
         return self.tf_buffer.lookup_transform(target, source, Time())
 
+    def plug_to_port_distance(self, port_frame, plug_frame):
+        """TF-based measure of how close the plug tip is to the port.
+
+        Returns ``(total_m, axial_m, lateral_m)`` where:
+          * total_m   : Euclidean distance plug -> port (meters)
+          * axial_m   : signed offset along the port's +Z (insertion) axis;
+                       positive means plug is ABOVE the port face
+          * lateral_m : in-plane distance from the port's insertion axis.
+        Raises TransformException if TF is unavailable.
+        """
+        port_tf = self.lookup_tf("base_link", port_frame)
+        plug_tf = self.lookup_tf("base_link", plug_frame)
+        port_pos = np.array([
+            port_tf.transform.translation.x,
+            port_tf.transform.translation.y,
+            port_tf.transform.translation.z,
+        ])
+        plug_pos = np.array([
+            plug_tf.transform.translation.x,
+            plug_tf.transform.translation.y,
+            plug_tf.transform.translation.z,
+        ])
+        q_port = (
+            port_tf.transform.rotation.w, port_tf.transform.rotation.x,
+            port_tf.transform.rotation.y, port_tf.transform.rotation.z,
+        )
+        axis = quat_to_rotmat(q_port)[:, 2]  # port +Z = insertion axis
+        delta = plug_pos - port_pos
+        axial = float(np.dot(delta, axis))
+        lateral = float(np.linalg.norm(delta - axial * axis))
+        total = float(np.linalg.norm(delta))
+        return total, axial, lateral
+
     def send_velocity(self, linear, angular, frame_id="base_link"):
+        """Send a velocity (twist) target. Used only for stop_robot()."""
         msg = MotionUpdate()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = frame_id
@@ -259,8 +356,148 @@ class AutoCollectNode(Node):
         msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_VELOCITY
         self.motion_pub.publish(msg)
 
+    def send_pose_target(self, position, quat_wxyz, frame_id="base_link"):
+        """Send an absolute pose target (MODE_POSITION).
+
+        Matches CheatCode's `set_pose_target` path which is the proven way to
+        drive the aic_controller. Use this for all motion during episodes.
+        """
+        msg = MotionUpdate()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        msg.pose = Pose(
+            position=Point(
+                x=float(position[0]), y=float(position[1]), z=float(position[2])
+            ),
+            orientation=Quaternion(
+                w=float(quat_wxyz[0]), x=float(quat_wxyz[1]),
+                y=float(quat_wxyz[2]), z=float(quat_wxyz[3]),
+            ),
+        )
+        # Same defaults as CheatCode / aic_model.policy.set_pose_target
+        msg.target_stiffness = np.diag([90.0, 90.0, 90.0, 50.0, 50.0, 50.0]).flatten()
+        msg.target_damping = np.diag([50.0, 50.0, 50.0, 20.0, 20.0, 20.0]).flatten()
+        msg.feedforward_wrench_at_tip = Wrench(
+            force=Vector3(x=0.0, y=0.0, z=0.0),
+            torque=Vector3(x=0.0, y=0.0, z=0.0),
+        )
+        msg.wrench_feedback_gains_at_tip = [0.5, 0.5, 0.5, 0.0, 0.0, 0.0]
+        msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_POSITION
+        self.motion_pub.publish(msg)
+
     def stop_robot(self):
         self.send_velocity([0, 0, 0], [0, 0, 0])
+
+    def retreat_vertical(self, lift_m=0.15, duration_s=2.5, fps=30):
+        """Smoothly lift the TCP straight up by `lift_m` in base_link Z+.
+
+        Used between attempts so the next episode's Approach doesn't yank a
+        seated cable back out, and to un-wedge the arm after a failed run.
+        Does not abort on force/stuck — just interpolates and returns.
+        """
+        try:
+            start_pos, start_quat = self.get_tcp_pose()
+        except Exception:
+            logger.warning("  retreat_vertical: TCP pose unavailable, skipping")
+            return
+        target_pos = start_pos + np.array([0.0, 0.0, lift_m])
+        steps = max(2, int(duration_s * fps))
+        for i in range(steps):
+            alpha = (i + 1) / steps
+            cmd_pos = (1.0 - alpha) * start_pos + alpha * target_pos
+            self.send_pose_target(cmd_pos, start_quat)
+            time.sleep(1.0 / fps)
+
+    def reset_simulation(self, port_frame, plug_frame, timeout_s=20.0):
+        """Call `/gz_server/reset_simulation` and wait for the scene to settle.
+
+        This is the core of Level-1 automation: instead of manually killing
+        and relaunching Gazebo between episodes, we ask gz_server to rewind
+        the world to its initial state. After the reset we:
+          1. Re-acquire TF frames for the port and plug,
+          2. Wait for the controller state + joint states to start publishing
+             fresh values (the tare offset will also reset),
+          3. Clear per-episode monitors.
+
+        Returns True on success, False on timeout/failure (caller should
+        consider aborting the whole run).
+        """
+        if not HAS_RESET_SIM_SRV or self._reset_sim_client is None:
+            logger.error("  reset_simulation: simulation_interfaces not available")
+            return False
+
+        if not self._reset_sim_client.wait_for_service(timeout_sec=5.0):
+            logger.error("  reset_simulation: /gz_server/reset_simulation not available")
+            return False
+
+        logger.info("  [RESET] Calling /gz_server/reset_simulation ...")
+        req = ResetSimulation.Request()
+        # scope=0 (SCOPE_DEFAULT): let the simulator decide. For gz_server
+        # this resets the world to its initial state, which is what we want.
+        future = self._reset_sim_client.call_async(req)
+
+        # Drop stale state so wait_for_state below blocks until the
+        # simulator genuinely re-publishes after the reset.
+        self.last_controller_state = None
+        self.last_joint_states = None
+        self.reset_episode_monitors()
+
+        t_start = time.monotonic()
+        while not future.done():
+            if time.monotonic() - t_start > timeout_s:
+                logger.error("  [RESET] service call timed out")
+                return False
+            time.sleep(0.05)
+
+        try:
+            resp = future.result()
+        except Exception as e:
+            logger.error(f"  [RESET] service raised: {e}")
+            return False
+
+        # simulation_interfaces uses a Result subfield with `result` code.
+        # Accept both the REP-2014 style (result.result) and the older
+        # success/bool style if present.
+        ok = True
+        if hasattr(resp, "result") and hasattr(resp.result, "result"):
+            ok = (resp.result.result == 1)  # RESULT_OK = 1
+            if not ok:
+                logger.error(
+                    f"  [RESET] service returned error: "
+                    f"{getattr(resp.result, 'error_message', '')}"
+                )
+        elif hasattr(resp, "success"):
+            ok = bool(resp.success)
+
+        if not ok:
+            return False
+
+        # Wait for controller to republish state post-reset.
+        try:
+            self.wait_for_state(timeout=10.0)
+        except TimeoutError:
+            logger.error("  [RESET] controller state never came back after reset")
+            return False
+
+        # Wait for TF frames (the scoring TF relay can take a beat to re-emit).
+        tf_deadline = time.monotonic() + 10.0
+        while time.monotonic() < tf_deadline:
+            try:
+                self.lookup_tf("base_link", port_frame)
+                self.lookup_tf("base_link", plug_frame)
+                self.lookup_tf("base_link", "gripper/tcp")
+                break
+            except TransformException:
+                time.sleep(0.2)
+        else:
+            logger.error("  [RESET] TF frames never reappeared after reset")
+            return False
+
+        # Extra settle time: the cable may still be falling / snapping into
+        # its initial attached-to-gripper pose right after the reset.
+        time.sleep(1.5)
+        logger.info("  [RESET] Scene reset complete.")
+        return True
 
     def get_tcp_pose(self):
         cs = self.last_controller_state
@@ -360,6 +597,27 @@ class ControllerGains:
     insertion_linear_vel: float = 0.01
 
 
+@dataclass
+class LateralIntegrator:
+    """CheatCode-style integrator for lateral (XY-in-port-frame) plug error.
+
+    During insertion descent, any residual lateral offset between the plug tip
+    and the port mouth is accumulated and fed back as a target-pose correction.
+    Mirrors the logic in CheatCode.calc_gripper_pose().
+    """
+    x: float = 0.0
+    y: float = 0.0
+    max_windup: float = 0.05  # matches CheatCode's _max_integrator_windup
+
+    def reset(self):
+        self.x = 0.0
+        self.y = 0.0
+
+    def update(self, u_error: float, v_error: float):
+        self.x = float(np.clip(self.x + u_error, -self.max_windup, self.max_windup))
+        self.y = float(np.clip(self.y + v_error, -self.max_windup, self.max_windup))
+
+
 ZERO_ACTION = {
     "linear.x": 0.0, "linear.y": 0.0, "linear.z": 0.0,
     "angular.x": 0.0, "angular.y": 0.0, "angular.z": 0.0,
@@ -400,10 +658,23 @@ def compute_velocity_action(
 # Target pose computation (from CheatCode logic)
 # ---------------------------------------------------------------------------
 
-def compute_target_pose(node, port_frame, plug_frame, z_offset=0.1):
+def compute_target_pose(
+    node,
+    port_frame,
+    plug_frame,
+    z_offset=0.1,
+    integrator: "LateralIntegrator | None" = None,
+    p_gain_lateral: float = 0.05,
+    i_gain_lateral: float = 0.15,
+    reset_integrator: bool = False,
+):
     """
     Compute gripper target pose that aligns plug with port,
     offset along the port's insertion axis by z_offset.
+
+    If `integrator` is provided, applies CheatCode-style P+I correction on
+    the plug's lateral (port-local XY) error. This is needed for reliable
+    descent — without it, steady-state lateral offset causes insertion to jam.
     """
     port_tf = node.lookup_tf("base_link", port_frame)
     plug_tf = node.lookup_tf("base_link", plug_frame)
@@ -433,10 +704,27 @@ def compute_target_pose(node, port_frame, plug_frame, z_offset=0.1):
                  gripper_tf.transform.rotation.y, gripper_tf.transform.rotation.z)
 
     R_port = quat_to_rotmat(q_port)
-    insertion_axis = R_port[:, 2]
+    insertion_axis = R_port[:, 2]   # port local Z = approach direction
+    lateral_u = R_port[:, 0]        # port local X
+    lateral_v = R_port[:, 1]        # port local Y
     plug_to_gripper = gripper_pos - plug_pos
 
-    target_plug_pos = port_pos + insertion_axis * z_offset
+    # Lateral P+I correction (CheatCode parity)
+    lateral_correction = np.zeros(3)
+    if integrator is not None:
+        error_vec = port_pos - plug_pos
+        u_error = float(np.dot(error_vec, lateral_u))
+        v_error = float(np.dot(error_vec, lateral_v))
+        if reset_integrator:
+            integrator.reset()
+        else:
+            integrator.update(u_error, v_error)
+        lateral_correction = (
+            lateral_u * (p_gain_lateral * u_error + i_gain_lateral * integrator.x)
+            + lateral_v * (p_gain_lateral * v_error + i_gain_lateral * integrator.y)
+        )
+
+    target_plug_pos = port_pos + insertion_axis * z_offset + lateral_correction
     target_gripper_pos = target_plug_pos + plug_to_gripper
 
     q_diff = quat_multiply(q_port, quat_conjugate(q_plug))
@@ -450,19 +738,39 @@ def compute_target_pose(node, port_frame, plug_frame, z_offset=0.1):
 # ---------------------------------------------------------------------------
 
 def create_or_resume_dataset(repo_id, root, fps=30, resume=False, vcodec="libsvtav1"):
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    root_path = Path(root)
 
-    if resume and Path(root).exists():
+    # Pre-flight: LeRobotDataset.create() requires the root NOT to exist.
+    # A common cause of failure is a previous aborted run leaving behind
+    # `root/meta/info.json` — give a clear error pointing at the fix.
+    if not resume and root_path.exists():
+        raise SystemExit(
+            f"\nERROR: dataset root already exists: {root_path}\n"
+            f"  - If this is leftover from a previous failed run, delete it:\n"
+            f"      rm -rf {root_path}\n"
+            f"  - If you want to keep adding episodes to it, rerun with --resume\n"
+        )
+
+    logger.info("Importing LeRobotDataset (torch/lerobot first-time import can take ~60s on cold cache)...")
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    logger.info("Import done.")
+
+    if resume and root_path.exists():
         logger.info(f"Resuming dataset at {root}")
-        return LeRobotDataset(repo_id, root=root, vcodec=vcodec)
+        ds = LeRobotDataset(repo_id, root=root, vcodec=vcodec)
+        _normalize_feature_shapes(ds)
+        return ds
 
     logger.info(f"Creating new dataset at {root}")
 
-    cam_shape = [256, 288, 3]
+    # NOTE: shapes must be TUPLES, not lists. lerobot.datasets.utils
+    # validate_frame() compares numpy's `value.shape` (tuple) against this
+    # field with strict `!=`, and `[6] != (6,)` always. See lerobot issue.
+    cam_shape = (256, 288, 3)
     features = {
         "observation.state": {
             "dtype": "float32",
-            "shape": [26],
+            "shape": (26,),
             "names": [
                 "tcp_pose.position.x", "tcp_pose.position.y", "tcp_pose.position.z",
                 "tcp_pose.orientation.x", "tcp_pose.orientation.y",
@@ -478,7 +786,7 @@ def create_or_resume_dataset(repo_id, root, fps=30, resume=False, vcodec="libsvt
         },
         "action": {
             "dtype": "float32",
-            "shape": [6],
+            "shape": (6,),
             "names": ["linear.x", "linear.y", "linear.z",
                       "angular.x", "angular.y", "angular.z"],
         },
@@ -500,12 +808,29 @@ def create_or_resume_dataset(repo_id, root, fps=30, resume=False, vcodec="libsvt
             },
         }
 
-    return LeRobotDataset.create(
+    logger.info("Calling LeRobotDataset.create() ...")
+    ds = LeRobotDataset.create(
         repo_id, fps, root=root, robot_type="ur5e_aic",
         features=features, use_videos=True,
         image_writer_processes=0, image_writer_threads=4 * 3,
         vcodec=vcodec,
     )
+    _normalize_feature_shapes(ds)
+    logger.info("Dataset created successfully.")
+    return ds
+
+
+def _normalize_feature_shapes(ds):
+    """Force every feature's ``shape`` to be a tuple.
+
+    lerobot's ``validate_frame`` uses strict ``!=`` between ``np.ndarray.shape``
+    (a tuple) and the ``shape`` entry from the feature dict. When features are
+    round-tripped through info.json they become lists, so ``(26,) != [26]``
+    raises ValueError even though the shapes are logically identical.
+    """
+    for feat in ds.meta.features.values():
+        if "shape" in feat:
+            feat["shape"] = tuple(feat["shape"])
 
 
 def build_frame(obs_dict, action_dict, images, dataset_features, task_str):
@@ -551,48 +876,89 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     node.reset_episode_monitors()
     result = EpisodeResult()
     t0 = time.monotonic()
-    last_pos = None
-    stuck_counter = 0
+    # Windowed stuck detection: record (timestamp, pos) samples and abort if
+    # total displacement over STUCK_WINDOW seconds is below STUCK_THRESH.
+    stuck_window_s = 3.0
+    stuck_thresh_m = 0.001   # 1 mm over 3s
+    stuck_samples: list = []
+    # CheatCode-style lateral integrator (shared across phases for one episode)
+    lateral_integrator = LateralIntegrator()
 
-    def step(action_dict):
-        """Record one frame and send velocity command."""
+    def step(action_dict, target_pos=None, target_quat_wxyz=None):
+        """Record one frame; drive robot by POSE target (MODE_POSITION).
+
+        The action recorded in the dataset is still a velocity (matching
+        lerobot-record/teleop conventions), but the robot is actually driven
+        by absolute pose targets -- the same proven control path used by
+        CheatCode. This avoids the "tracking error not converging" behavior
+        we saw when sending velocity commands in a tight loop.
+        """
         obs_dict = node.get_observation_dict()
         images = cameras.get_images()
         result.frames.append((obs_dict, action_dict, images))
-        node.send_velocity(
-            [action_dict["linear.x"], action_dict["linear.y"], action_dict["linear.z"]],
-            [action_dict["angular.x"], action_dict["angular.y"], action_dict["angular.z"]],
-        )
+        if target_pos is not None and target_quat_wxyz is not None:
+            node.send_pose_target(target_pos, target_quat_wxyz)
 
     def check_abort():
         """Check all abort conditions. Returns reason string or None."""
-        nonlocal last_pos, stuck_counter
-        if time.monotonic() - t0 > max_time:
+        now = time.monotonic()
+        if now - t0 > max_time:
             return "timeout"
         if node.collision_detected.is_set():
             return "off-limit collision"
         if node.is_force_abort():
             return f"force too high ({node.get_force_stats()['current']:.1f}N > {FORCE_ABORT}N)"
 
-        # Stuck detection: if TCP hasn't moved >0.5mm in 2 seconds
+        # Stuck detection: max TCP displacement from any sample in the last
+        # `stuck_window_s` seconds must exceed `stuck_thresh_m`.
         cur_pos, _ = node.get_tcp_pose()
-        if last_pos is not None:
-            if np.linalg.norm(cur_pos - last_pos) < 0.0005:
-                stuck_counter += 1
-                if stuck_counter > fps * 2:
-                    return "robot stuck (no motion for 2s)"
-            else:
-                stuck_counter = 0
-        last_pos = cur_pos.copy()
+        stuck_samples.append((now, cur_pos.copy()))
+        while stuck_samples and now - stuck_samples[0][0] > stuck_window_s:
+            stuck_samples.pop(0)
+        if (
+            len(stuck_samples) > 1
+            and now - stuck_samples[0][0] >= stuck_window_s - 0.1
+        ):
+            max_disp = max(
+                np.linalg.norm(cur_pos - p) for _, p in stuck_samples
+            )
+            if max_disp < stuck_thresh_m:
+                return (
+                    f"robot stuck (max {max_disp*1000:.2f}mm in "
+                    f"{stuck_window_s:.1f}s < {stuck_thresh_m*1000:.1f}mm)"
+                )
         return None
 
-    def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False):
-        """Run a control phase. Returns True if should continue, False if aborted/done."""
-        logger.info(f"  Phase: {name}")
+    def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False,
+                  use_integrator=False, reset_integrator_first=False,
+                  interpolate_from_current=False, interpolate_steps=None):
+        """Run a control phase. Returns True if should continue, False if aborted/done.
+
+        If `interpolate_from_current` is True, the FIRST `interpolate_steps`
+        ticks (default: all of max_steps) send a linearly interpolated pose
+        target going from the current TCP pose to the final computed target.
+        This avoids the impedance controller snapping to a distant target and
+        slamming into obstacles.
+        """
+        try:
+            tp, _ = compute_target_pose(node, port_frame, plug_frame, z_offset=z_start)
+            cp, _ = node.get_tcp_pose()
+            logger.info(
+                f"  Phase: {name}  (initial dist-to-target = "
+                f"{np.linalg.norm(tp - cp)*100:.1f} cm)"
+            )
+        except TransformException:
+            logger.info(f"  Phase: {name}")
         if z_start == z_end:
             z_values = [z_start] * max_steps
         else:
             z_values = np.linspace(z_start, z_end, num=max_steps)
+
+        # Snapshot of the TCP pose at the START of the phase, used only for
+        # the optional interpolation ramp.
+        if interpolate_from_current:
+            start_pos, start_quat = node.get_tcp_pose()
+            ramp_steps = interpolate_steps if interpolate_steps else max_steps
 
         for i, z in enumerate(z_values):
             if node.insertion_detected.is_set():
@@ -605,12 +971,23 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                 return False
 
             try:
-                target_pos, target_quat = compute_target_pose(node, port_frame, plug_frame, z_offset=z)
+                target_pos, target_quat = compute_target_pose(
+                    node, port_frame, plug_frame, z_offset=z,
+                    integrator=lateral_integrator if use_integrator else None,
+                    reset_integrator=(reset_integrator_first and i == 0),
+                )
                 cur_pos, cur_quat = node.get_tcp_pose()
                 action, dist = compute_velocity_action(
                     cur_pos, cur_quat, target_pos, target_quat, gains, insertion_phase=is_insertion
                 )
-                step(action)
+
+                if interpolate_from_current and i < ramp_steps:
+                    alpha = (i + 1) / ramp_steps
+                    cmd_pos = (1.0 - alpha) * start_pos + alpha * target_pos
+                    cmd_quat = quat_nlerp(start_quat, target_quat, alpha)
+                else:
+                    cmd_pos, cmd_quat = target_pos, target_quat
+                step(action, target_pos=cmd_pos, target_quat_wxyz=cmd_quat)
 
                 # Log force periodically during insertion phase
                 if is_insertion and i % (fps * 2) == 0:
@@ -630,43 +1007,95 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
             time.sleep(1.0 / fps)
         return True
 
-    # Phase 1: Approach — move above port
+    # Phase 1: Approach — move above port.
+    # CheatCode-style smooth interpolation from the CURRENT TCP pose to the
+    # above-port target over the full phase (~8s at 30Hz). This handles both
+    # the first-attempt startup (arm may be ~25cm from target) and recovery
+    # from earlier attempts (arm may be jammed against the board).
     approach_gains = ControllerGains(kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3)
-    if not run_phase("Approach", z_start=0.12, z_end=0.12, gains=approach_gains, max_steps=fps * 8):
+    approach_steps = fps * 8
+    if not run_phase("Approach", z_start=0.12, z_end=0.12, gains=approach_gains,
+                     max_steps=approach_steps, use_integrator=False,
+                     interpolate_from_current=True,
+                     interpolate_steps=int(approach_steps * 0.75)):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
 
-    # Phase 2: Fine alignment — lower and correct
+    # Phase 2: Fine alignment — lower and correct lateral offset (I-gain on from here)
     fine_gains = ControllerGains(kp_linear=2.0, max_linear_vel=0.02, kp_angular=2.5, max_angular_vel=0.2)
-    if not run_phase("Fine align", z_start=0.06, z_end=0.06, gains=fine_gains, max_steps=fps * 4):
+    if not run_phase("Fine align", z_start=0.06, z_end=0.06, gains=fine_gains,
+                     max_steps=fps * 4, use_integrator=True, reset_integrator_first=True):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
 
-    # Phase 3: Insertion descent — slow and force-aware
+    # Phase 3: Insertion descent — slow, force-aware, integrator still active
     insert_gains = ControllerGains(
         kp_linear=2.0, max_linear_vel=0.01, insertion_linear_vel=0.008,
         kp_angular=2.5, max_angular_vel=0.15,
     )
     if not run_phase("Insertion", z_start=0.06, z_end=-0.015, gains=insert_gains,
-                     max_steps=fps * 12, is_insertion=True):
+                     max_steps=fps * 12, is_insertion=True, use_integrator=True):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
 
-    # Phase 4: Hold — wait for insertion event
-    logger.info("  Phase: Hold")
-    for _ in range(fps * 3):
+    # Phase 4: Hold — keep pressing at insertion depth and wait for either
+    # the /scoring/insertion_event message (gold standard) OR a TF-based
+    # check that the plug tip has seated into the port (fallback that works
+    # even if the lazy gz_ros_bridge drops the event).
+    #
+    # Hold duration is deliberately long (~8s) because the cable has
+    # noticeable settling dynamics: plug may need a moment to fully seat.
+    logger.info("  Phase: Hold (keeping insertion pressure)")
+    hold_seconds = 8.0
+    tf_success = False
+    tf_success_streak = 0  # require a few consecutive matches to avoid flicker
+    hold_start = time.monotonic()
+    while time.monotonic() - hold_start < hold_seconds:
         if node.insertion_detected.is_set():
             break
-        step(ZERO_ACTION)
+
+        # Keep pressing: recompute the same "slightly below port face" target
+        # each tick so the controller maintains insertion force.
+        try:
+            tp, tq = compute_target_pose(
+                node, port_frame, plug_frame, z_offset=-0.015,
+                integrator=lateral_integrator, reset_integrator=False,
+            )
+            step(ZERO_ACTION, target_pos=tp, target_quat_wxyz=tq)
+        except TransformException:
+            step(ZERO_ACTION)
+
+        # TF-based success: plug is at port (<=1cm total, <=5mm lateral) and
+        # it's there for >=0.5s.
+        try:
+            total, axial, lateral = node.plug_to_port_distance(port_frame, plug_frame)
+            if total < 0.01 and lateral < 0.005:
+                tf_success_streak += 1
+                if tf_success_streak >= int(fps * 0.5):
+                    logger.info(
+                        f"  [TF] Plug seated: total={total*1000:.1f}mm "
+                        f"axial={axial*1000:+.1f}mm lateral={lateral*1000:.1f}mm"
+                    )
+                    tf_success = True
+                    break
+            else:
+                tf_success_streak = 0
+        except TransformException:
+            pass
+
         time.sleep(1.0 / fps)
 
-    node.stop_robot()
+    # DON'T call stop_robot(): keep the insertion-pressure target in place
+    # until the caller explicitly retreats. Otherwise the impedance controller
+    # could drift and pull the cable back out.
 
     # Collect results
-    result.success = node.insertion_detected.is_set()
+    result.success = node.insertion_detected.is_set() or tf_success
+    if tf_success and not node.insertion_detected.is_set():
+        logger.info("  (insertion confirmed by TF; /scoring/insertion_event not received)")
     fs = node.get_force_stats()
     result.max_force = fs["max"]
     result.time_above_force_threshold = fs["time_above_threshold"]
@@ -695,6 +1124,29 @@ def main():
     ap.add_argument("--max-episode-time", type=float, default=60.0, help="Max seconds per attempt")
     ap.add_argument("--discard-high-force", action="store_true",
                     help="Discard episodes where force exceeded scoring threshold for >1s")
+    ap.add_argument(
+        "--reset-scene", action="store_true",
+        help=(
+            "[BROKEN/EXPERIMENTAL] Was intended to call "
+            "/gz_server/reset_simulation between attempts. On the current "
+            "build this reset causes ros2_control inside the same container "
+            "to reload and segfault (container exit code -11). Flag is "
+            "accepted for backward compatibility but is a no-op and logs a "
+            "warning."
+        ),
+    )
+    ap.add_argument(
+        "--exit-on-success", action="store_true",
+        help=(
+            "Stop as soon as one episode is saved. Recommended per-launch "
+            "workflow: with a fresh Gazebo launch, run with "
+            "--num-episodes 1 --max-attempts 5 --exit-on-success. Once the "
+            "first successful insertion is captured, the script exits "
+            "cleanly. Kill Gazebo, relaunch, and rerun with --resume to "
+            "append the next episode. This avoids follow-up attempts "
+            "trying to insert a cable that's already seated."
+        ),
+    )
     args = ap.parse_args()
 
     rclpy.init()
@@ -751,6 +1203,15 @@ def main():
 
     logger.info(f"=== Starting collection: {args.num_episodes} episodes, max {args.max_attempts} attempts ===")
 
+    if args.reset_scene:
+        logger.warning(
+            "--reset-scene is currently a no-op. On this build, calling "
+            "/gz_server/reset_simulation crashes the ros_gz_container "
+            "(ros2_control tries to reload inside the same process and "
+            "segfaults). Use the manual-relaunch + --resume workflow "
+            "instead. See docs/auto_collection_guide.md."
+        )
+
     try:
         while successes < args.num_episodes and attempts < args.max_attempts:
             attempts += 1
@@ -800,12 +1261,29 @@ def main():
                     dataset.add_frame(frame)
                 dataset.save_episode()
                 successes += 1
+
+                # Per-launch workflow: the cable is now seated in the port.
+                # Any further attempts within this Gazebo session would
+                # have to rip it back out, which produces poor data and
+                # can wedge the arm. Exit cleanly so the user can relaunch
+                # Gazebo and come back with --resume.
+                if args.exit_on_success:
+                    logger.info(
+                        "  --exit-on-success: stopping after first saved "
+                        "episode. Relaunch Gazebo and rerun with --resume "
+                        "to collect the next one."
+                    )
+                    break
             else:
                 dataset.clear_episode_buffer()
 
-            # Pause between episodes
+            # Between failed attempts within the same launch: lift straight
+            # up by 15 cm so that
+            #   (a) a stuck/jammed arm is pulled off any contact, and
+            #   (b) the next Approach interpolation starts from clear space.
+            node.retreat_vertical(lift_m=0.15, duration_s=2.5, fps=args.fps)
             node.stop_robot()
-            time.sleep(2.0)
+            time.sleep(1.0)
 
     except KeyboardInterrupt:
         logger.info("\nInterrupted by user (Ctrl+C)")

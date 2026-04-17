@@ -22,7 +22,7 @@ Plug position (from /tf)  ───►  orientation alignment        ──►  
 ```
 
 1. **TF lookups** — uses ground-truth frames (`ground_truth:=true`) to find the exact port and plug positions, same as CheatCode
-2. **Proportional controller** — converts the position error into a velocity command: `velocity = gain × (target - current)`, clamped to safe limits
+2. **Proportional controller + lateral P+I** — converts position error into a velocity command: `velocity = gain × (target - current)`, clamped to safe limits. During the fine-align and insert phases we additionally apply a CheatCode-style integrator on the plug's lateral (port-local XY) error to eliminate steady-state offset — without this, descent often jams at the port mouth.
 3. **Recording** — captures observations (26-dim state + 3 camera images) and actions (6D velocity) using the same `LeRobotDataset` API that `lerobot-record` uses internally
 4. **Success filtering** — monitors `/scoring/insertion_event` and only saves episodes where insertion actually succeeded
 5. **Safety monitoring** — tracks force, collisions, and stuck conditions to discard bad episodes
@@ -59,7 +59,11 @@ Not all attempts succeed. The script automatically discards bad episodes:
 
 ## How to Run
 
-### Terminal 1 — Launch Gazebo scene
+The supported workflow is **one episode per Gazebo launch**, repeated until
+you have enough episodes. See the "Recommended workflow" section further
+down for a full explanation of why. Two terminals, one loop:
+
+### Terminal 1 — Launch Gazebo (one launch = one episode attempt)
 
 ```bash
 source ~/lab/ws_aic/setup_dev.sh
@@ -70,48 +74,66 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
   nic_card_mount_0_present:=true
 ```
 
-Change `nic_card_mount_0_present:=true` to any config from [`sfp_scene_configs.md`](sfp_scene_configs.md).
+Swap NIC mount / cable type / port arguments as needed between launches.
+See [`sfp_scene_configs.md`](sfp_scene_configs.md) for the full config
+matrix.
 
-### Terminal 2 — Run auto collection
+### Terminal 2 — Run auto collection (once per launch)
 
-**First run (creates dataset):**
+**Very first episode (creates the dataset — do NOT use `--resume`):**
 
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic
 pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
-  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-dataset/sfp_auto \
+  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
   --repo-id atang/aic_sfp_auto \
-  --num-episodes 10 \
-  --max-attempts 20
+  --num-episodes 1 --max-attempts 5 --exit-on-success
 ```
 
-**Subsequent runs (resume existing dataset):**
+This runs up to 5 attempts within the current Gazebo session until one
+insertion succeeds, then exits. If none of the 5 attempts succeed, it
+stops and nothing is written to the dataset for this launch.
+
+**Every episode after that (always use `--resume` to append):**
 
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic
 pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
-  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-dataset/sfp_auto \
+  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
   --repo-id atang/aic_sfp_auto \
-  --num-episodes 10 \
-  --max-attempts 20 \
-  --resume
+  --num-episodes 1 --max-attempts 5 --exit-on-success --resume
 ```
 
-### Quick test (2 episodes, verify everything works)
+With `--resume`, existing episodes are **never touched** — the script
+validates the dataset schema and appends the new one. Without `--resume`,
+if the dataset root already exists the script exits with a clear error
+rather than overwriting.
+
+### Loop for an evening of collection
+
+1. Launch Gazebo (Terminal 1) with the config you want for this episode.
+2. Run the collector (Terminal 2) with `--exit-on-success` (and `--resume`
+   on every run except the very first).
+3. When the script exits, `Ctrl-C` Gazebo in Terminal 1.
+4. Relaunch Gazebo with the next config (or the same one — your call).
+5. Go to step 2. Keep going until you have your target episode count.
+
+### Quick smoke test (separate dataset, same workflow)
+
+Use a throwaway dataset path so it doesn't mix with your real one:
 
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic
 pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
-  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-dataset/sfp_auto_test \
+  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp_test \
   --repo-id atang/aic_sfp_auto_test \
-  --num-episodes 2 \
-  --max-attempts 5
+  --num-episodes 1 --max-attempts 5 --exit-on-success
 ```
 
-After verifying the test works, delete it:
+After verifying, delete it before starting real collection:
 
 ```bash
-rm -rf /scratch2/atang/ws_aic/teleop-dataset/sfp_auto_test
+rm -rf /scratch2/atang/ws_aic/teleop-automated-dataset/sfp_test
 ```
 
 ## CLI Options
@@ -129,6 +151,61 @@ rm -rf /scratch2/atang/ws_aic/teleop-dataset/sfp_auto_test
 | `--vcodec` | `libsvtav1` | Video codec (`libsvtav1` or `h264`) |
 | `--max-episode-time` | 60.0 | Max seconds per attempt |
 | `--discard-high-force` | false | Discard episodes where force > 20 N for > 1s |
+| `--exit-on-success` | false | Stop as soon as one episode is saved. Recommended for the per-launch workflow below. |
+| `--reset-scene` | false | **No-op / broken.** Calling `/gz_server/reset_simulation` on this build crashes the `ros_gz_container` (ros2_control reloads inside the same process and segfaults). Flag is accepted for backward compatibility only. |
+
+## Recommended workflow: one episode per Gazebo launch
+
+The scene only spawns **one** cable (`cable_0`). Once that cable is latched
+into the port, any additional attempts in the same Gazebo session must either
+rip it back out or wedge the arm — both produce garbage data. So the
+supported unattended-ish workflow is **one episode per launch**, repeated
+until you've collected the target number of episodes:
+
+1. Launch Gazebo with your config:
+
+   ```bash
+   ros2 launch aic_bringup aic_gz_bringup.launch.py \
+     ground_truth:=true start_aic_engine:=false \
+     spawn_task_board:=true spawn_cable:=true \
+     attach_cable_to_gripper:=true cable_type:=sfp_sc_cable \
+     nic_card_mount_0_present:=true
+   ```
+2. In another terminal, run the collector in "grab one" mode. First time:
+
+   ```bash
+   cd /run/host/scratch2/atang/ws_aic/src/aic
+   pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
+     --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
+     --repo-id atang/aic_sfp_auto \
+     --num-episodes 1 --max-attempts 5 --exit-on-success
+   ```
+
+   The script retries up to 5 times until one successful insertion is captured,
+   then exits. If none succeed, it stops after 5 attempts with nothing saved.
+3. Kill Gazebo (`Ctrl-C`). Optionally change configs (different NIC slot,
+   cable type, etc.).
+4. Relaunch Gazebo. Rerun the script with `--resume` to append to the same
+   dataset:
+
+   ```bash
+   pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
+     --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
+     --repo-id atang/aic_sfp_auto \
+     --num-episodes 1 --max-attempts 5 --exit-on-success --resume
+   ```
+5. Repeat steps 3–4 until you have N episodes.
+
+This also lets you naturally vary configs between episodes (just change the
+launch args) without any scripting gymnastics — the dataset keeps growing
+across launches thanks to `--resume`.
+
+### Why not `--reset-scene`?
+
+`/gz_server/reset_simulation` *does* rewind the Gazebo world, but on this
+build the reset path unloads and reloads the entire ros2_control stack
+inside the same container, which segfaults shortly after (container exits
+with code −11). The script now warns and no-ops the flag.
 
 ## Changing the Target Port or NIC Slot
 
@@ -147,14 +224,14 @@ For SFP on different NIC slots:
 | Slot 3 | `task_board/nic_card_mount_3/sfp_port_0_link` |
 | Slot 4 | `task_board/nic_card_mount_4/sfp_port_0_link` |
 
-Example for slot 2:
+Example for slot 2 (remember: one episode per launch, so `--num-episodes 1`):
 
 ```bash
 pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
-  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-dataset/sfp_auto \
+  --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset/sfp \
   --repo-id atang/aic_sfp_auto \
   --port-frame "task_board/nic_card_mount_2/sfp_port_0_link" \
-  --num-episodes 10 --resume
+  --num-episodes 1 --max-attempts 5 --exit-on-success --resume
 ```
 
 Make sure the Gazebo scene has the matching NIC mount present (e.g., `nic_card_mount_2_present:=true`).
@@ -176,7 +253,7 @@ If the robot doesn't behave well, adjust these parameters in the script (search 
 The script produces a standard LeRobot dataset identical to `lerobot-record` output:
 
 ```
-teleop-dataset/sfp_auto/
+teleop-automated-dataset/sfp/
 ├── meta/
 │   ├── info.json          # Dataset metadata
 │   ├── stats.json         # Feature statistics
@@ -206,7 +283,7 @@ The automated dataset can be merged with manual teleop data for training. Both d
 |--------|--------------|----------------|
 | **Approach diversity** | High — humans vary paths naturally | Low — same proportional controller path |
 | **Recovery behaviors** | Yes — humans correct mistakes | No — controller never makes mistakes |
-| **Speed** | ~30-40 demos/hour per person | Hundreds/hour, unattended |
+| **Speed** | ~30-40 demos/hour per person | ~20-60/hour with per-launch workflow; bound by Gazebo launch time |
 | **Force awareness** | Human feels resistance and backs off | Controller pushes until abort threshold |
 | **Coverage** | Limited by operator time | Can run overnight across many configs |
 
