@@ -154,6 +154,9 @@ rm -rf /scratch2/atang/ws_aic/teleop-automated-dataset/sfp_test
 | `--exit-on-success` | false | Stop as soon as one episode is saved. Recommended for the per-launch workflow below. |
 | `--noise-scale` | 1.0 | Scales per-episode target-pose noise. See [Target-pose noise](#target-pose-noise). Pass `0` to disable. |
 | `--seed` | (none) | Optional RNG seed for reproducible noise profiles. |
+| `--no-settle` | false | Disable the pre-approach cable-settle step. For A/B debugging only — see [Cable-settle / frozen offset](#cable-settle--frozen-offset). |
+| `--settle-lift-m` | 0.15 | How far the gripper lifts during the cable-settle ramp. |
+| `--settle-lateral-abort-m` | 0.04 | Abort the attempt early if the settled plug→gripper vector has a lateral component larger than this (meters). `0` disables the check. |
 | `--reset-scene` | false | **No-op / broken.** Calling `/gz_server/reset_simulation` on this build crashes the `ros_gz_container` (ros2_control reloads inside the same process and segfaults). Flag is accepted for backward compatibility only. |
 
 ## Target-pose noise
@@ -189,6 +192,75 @@ visible variance instead of being dead-zero most of the time.
 Pass `--noise-scale 0` to reproduce the old deterministic behavior (useful for
 debugging). Pass `--seed 42` along with it to get a reproducible profile
 across identical configs.
+
+## Cable-settle / frozen offset
+
+### The problem this fixes
+
+`compute_target_pose` converts a *desired plug position* into a *desired
+gripper pose* by adding a "plug → gripper" offset. Earlier versions read
+that offset live from TF every tick:
+
+```python
+plug_to_gripper = gripper_pos - plug_pos   # recomputed every tick
+target_gripper = target_plug + plug_to_gripper
+```
+
+With a rigid cable this is exact. With the flexible SFP cable it creates
+a **positive-feedback drift**: as soon as the plug bends to the side, the
+offset grows, the target gripper pose wanders with it, and the controller
+chases the drift instead of correcting it. The symptom in the logs is a
+descent where `z` drops 6 cm while `dist-to-target` stays pinned at ~10 cm
+for the whole insertion phase — the plug was pressing against the board
+10 cm away from the port, and the controller was happy because its (also
+drifting) target moved along with the gripper.
+
+### What the script does now
+
+Before each attempt the script runs `AutoCollectNode.settle_cable()`:
+
+1. Lift the gripper straight up `--settle-lift-m` meters (default 15 cm).
+2. Hold for 2 s so the cable settles straight down under gravity.
+3. Sample `plug_to_gripper` a handful of times and average.
+4. Pass that **frozen** offset to every `compute_target_pose` call for the
+   rest of the episode.
+
+The integrator still references the *true* port↔plug error, so real
+mis-alignment is still corrected — but the target gripper pose now has a
+single stable attractor instead of drifting with the cable.
+
+### Pre-flight reject
+
+If the settled offset has a large lateral component (the cable never
+straightened, usually from a previous attempt leaving it jammed), the
+attempt is aborted **before** Approach with reason `cable_bent_on_settle`.
+The default cutoff is 4 cm lateral (`--settle-lateral-abort-m 0.04`);
+tune it per setup if you see false aborts. This saves the ~40 s you'd
+otherwise burn doing a descent that was doomed from the start.
+
+### Tuning knobs
+
+- `--no-settle` — disable entirely and fall back to the old live-offset
+  path. Only useful for A/B debugging ("is the fix the reason X
+  changed?"); leave it off in production.
+- `--settle-lift-m 0.20` — lift further if 15 cm isn't enough clearance
+  between the plug and the board for the cable to hang straight.
+- `--settle-lateral-abort-m 0` — accept any cable pose (no pre-flight
+  reject). Useful if your grasp configuration legitimately has a large
+  sideways offset.
+
+### Expected log
+
+The first line of each attempt is now the settle diagnostic:
+
+```
+Cable settled: length=10.3cm lateral=0.6cm z=+10.3cm
+```
+
+`length` is the total plug→gripper distance, `lateral` is the XY
+component (small = cable hanging straight), `z` is vertical (positive =
+gripper above plug, which is what we want). If you see lateral > 4 cm,
+the episode is aborted with `cable_bent_on_settle`.
 
 ## Recommended workflow: one episode per Gazebo launch
 

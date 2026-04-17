@@ -388,6 +388,82 @@ class AutoCollectNode(Node):
     def stop_robot(self):
         self.send_velocity([0, 0, 0], [0, 0, 0])
 
+    def settle_cable(self, plug_frame, lift_m=0.15, ramp_s=2.0, hold_s=2.0, fps=30):
+        """Slowly lift the gripper, hold, and sample the plug->gripper offset.
+
+        Why this exists
+        ---------------
+        ``compute_target_pose`` computes ``target_gripper = target_plug +
+        (gripper_current - plug_current)`` every tick. With a rigid cable
+        that's exact; with a *flexible* cable, the offset changes as the
+        cable bends. Recomputing it every tick turns the control loop into
+        a positive-feedback drift: when the plug gets stuck, the target
+        wanders with the gripper instead of staying fixed. So the arm
+        descends 6 cm while the distance to target stays stuck at 10 cm
+        (see the Apr-17 03:14 attempt-1 trace).
+
+        Fix: measure the offset ONCE with the cable dangling straight under
+        gravity, then freeze it for the whole episode. This routine runs
+        before each attempt to produce that reference offset.
+
+        Returns
+        -------
+        plug_to_gripper_ref : np.ndarray shape (3,) in base_link frame,
+            or ``None`` if TF was unavailable during sampling.
+        diag : dict with keys 'length_m', 'lateral_m', 'z_m' describing
+            the settled geometry (useful for the pre-flight reject check).
+        """
+        try:
+            start_pos, start_quat = self.get_tcp_pose()
+        except Exception:
+            logger.warning("  settle_cable: TCP pose unavailable")
+            return None, {}
+
+        top_pos = start_pos + np.array([0.0, 0.0, lift_m])
+
+        ramp_steps = max(2, int(ramp_s * fps))
+        for i in range(ramp_steps):
+            alpha = (i + 1) / ramp_steps
+            cmd_pos = (1.0 - alpha) * start_pos + alpha * top_pos
+            self.send_pose_target(cmd_pos, start_quat)
+            time.sleep(1.0 / fps)
+
+        hold_steps = max(1, int(hold_s * fps))
+        for _ in range(hold_steps):
+            self.send_pose_target(top_pos, start_quat)
+            time.sleep(1.0 / fps)
+
+        # Sample offset after the hold. Average a few ticks to de-noise.
+        samples = []
+        for _ in range(max(3, int(0.3 * fps))):
+            try:
+                gripper_tf = self.lookup_tf("base_link", "gripper/tcp")
+                plug_tf = self.lookup_tf("base_link", plug_frame)
+                g = np.array([gripper_tf.transform.translation.x,
+                              gripper_tf.transform.translation.y,
+                              gripper_tf.transform.translation.z])
+                p = np.array([plug_tf.transform.translation.x,
+                              plug_tf.transform.translation.y,
+                              plug_tf.transform.translation.z])
+                samples.append(g - p)
+            except TransformException:
+                pass
+            time.sleep(1.0 / fps)
+
+        if not samples:
+            logger.warning("  settle_cable: no TF samples collected")
+            return None, {}
+
+        offset = np.mean(np.stack(samples, axis=0), axis=0)
+        length = float(np.linalg.norm(offset))
+        lateral = float(np.linalg.norm(offset[:2]))
+        diag = {"length_m": length, "lateral_m": lateral, "z_m": float(offset[2])}
+        logger.info(
+            f"  Cable settled: length={length*100:.1f}cm "
+            f"lateral={lateral*100:.1f}cm z={offset[2]*100:+.1f}cm"
+        )
+        return offset, diag
+
     def retreat_vertical(self, lift_m=0.15, duration_s=2.5, fps=30):
         """Smoothly lift the TCP straight up by `lift_m` in base_link Z+.
 
@@ -669,6 +745,7 @@ def compute_target_pose(
     reset_integrator: bool = False,
     lateral_noise_port_frame=None,
     yaw_noise: float = 0.0,
+    plug_to_gripper_override=None,
 ):
     """
     Compute gripper target pose that aligns plug with port,
@@ -690,6 +767,14 @@ def compute_target_pose(
     around the port's insertion axis on top of the computed target quat.
     Small values (|y| < 0.05 rad ~ 3°) look like imperfect wrist alignment
     but don't break insertion.
+
+    ``plug_to_gripper_override`` (np.ndarray shape (3,)) freezes the
+    plug->gripper offset used when converting from target_plug_pos to
+    target_gripper_pos. Without it, the offset is recomputed from the
+    LIVE plug position every tick, which produces positive-feedback drift
+    when the cable bends. Pass a value sampled once with the cable
+    settled straight (via ``AutoCollectNode.settle_cable``) for stable
+    descent.
     """
     port_tf = node.lookup_tf("base_link", port_frame)
     plug_tf = node.lookup_tf("base_link", plug_frame)
@@ -722,7 +807,10 @@ def compute_target_pose(
     insertion_axis = R_port[:, 2]   # port local Z = approach direction
     lateral_u = R_port[:, 0]        # port local X
     lateral_v = R_port[:, 1]        # port local Y
-    plug_to_gripper = gripper_pos - plug_pos
+    if plug_to_gripper_override is not None:
+        plug_to_gripper = np.asarray(plug_to_gripper_override, dtype=float)
+    else:
+        plug_to_gripper = gripper_pos - plug_pos
 
     # Lateral P+I correction (CheatCode parity)
     lateral_correction = np.zeros(3)
@@ -933,11 +1021,25 @@ def _sample_noise_profile(rng, scale=1.0):
 
 
 def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
-                noise_scale: float = 1.0, rng: "np.random.Generator | None" = None):
+                noise_scale: float = 1.0, rng: "np.random.Generator | None" = None,
+                settle_lift_m: float = 0.15, settle_lateral_abort_m: float = 0.04,
+                freeze_plug_offset: bool = True):
     """Execute one insertion episode with full safety monitoring.
 
     ``noise_scale`` (0.0 disables) multiplies all per-phase target-pose
     perturbations. See ``_sample_noise_profile`` for the sampling ranges.
+
+    ``freeze_plug_offset`` (default True) runs a cable-settle ramp before
+    the Approach phase and samples ``plug_to_gripper`` once at the settled
+    pose; that frozen offset is then used by ``compute_target_pose`` for
+    the entire episode. This prevents the positive-feedback drift where
+    the target gripper pose wanders with the flexible cable.
+
+    ``settle_lateral_abort_m`` — after settling, if the lateral component
+    of the measured plug->gripper vector exceeds this (default 4 cm) the
+    attempt is aborted immediately with ``cable_bent_on_settle``. That
+    saves the ~40 s we'd otherwise spend slamming the cable sideways
+    into the board. Set ``0`` to disable the pre-flight reject.
     """
     node.reset_episode_monitors()
     result = EpisodeResult()
@@ -966,6 +1068,34 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
             f"dyaw={math.degrees(noise['align_yaw']):+.2f}deg  |  "
             f"insert dXY=({noise['insert'][0]*1000:+.1f},{noise['insert'][1]*1000:+.1f})mm"
         )
+
+    # Pre-flight: let the cable dangle straight and freeze the plug offset
+    # so compute_target_pose has a stable reference through all phases.
+    plug_offset_ref = None
+    if freeze_plug_offset:
+        plug_offset_ref, settle_diag = node.settle_cable(
+            plug_frame=plug_frame, lift_m=settle_lift_m, fps=fps
+        )
+        if plug_offset_ref is None:
+            result.aborted = True
+            result.abort_reason = "settle_cable_failed (no TF)"
+            result.duration = time.monotonic() - t0
+            return result
+        if (
+            settle_lateral_abort_m > 0
+            and settle_diag.get("lateral_m", 0.0) > settle_lateral_abort_m
+        ):
+            logger.warning(
+                f"  Cable still bent after settle: lateral="
+                f"{settle_diag['lateral_m']*100:.1f}cm > "
+                f"{settle_lateral_abort_m*100:.1f}cm — aborting attempt early."
+            )
+            result.aborted = True
+            result.abort_reason = (
+                f"cable_bent_on_settle ({settle_diag['lateral_m']*100:.1f}cm lateral)"
+            )
+            result.duration = time.monotonic() - t0
+            return result
 
     def step(action_dict, target_pos=None, target_quat_wxyz=None):
         """Record one frame; drive robot by POSE target (MODE_POSITION).
@@ -1015,7 +1145,8 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
     def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False,
                   use_integrator=False, reset_integrator_first=False,
                   interpolate_from_current=False, interpolate_steps=None,
-                  lateral_noise=None, yaw_noise=0.0):
+                  lateral_noise=None, yaw_noise=0.0,
+                  plug_offset=plug_offset_ref):
         """Run a control phase. Returns True if should continue, False if aborted/done.
 
         If `interpolate_from_current` is True, the FIRST `interpolate_steps`
@@ -1029,7 +1160,10 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
         this phase and passed to ``compute_target_pose``.
         """
         try:
-            tp, _ = compute_target_pose(node, port_frame, plug_frame, z_offset=z_start)
+            tp, _ = compute_target_pose(
+                node, port_frame, plug_frame, z_offset=z_start,
+                plug_to_gripper_override=plug_offset,
+            )
             cp, _ = node.get_tcp_pose()
             logger.info(
                 f"  Phase: {name}  (initial dist-to-target = "
@@ -1065,6 +1199,7 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
                     reset_integrator=(reset_integrator_first and i == 0),
                     lateral_noise_port_frame=lateral_noise,
                     yaw_noise=yaw_noise,
+                    plug_to_gripper_override=plug_offset,
                 )
                 cur_pos, cur_quat = node.get_tcp_pose()
                 action, dist = compute_velocity_action(
@@ -1159,6 +1294,7 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
             tp, tq = compute_target_pose(
                 node, port_frame, plug_frame, z_offset=-0.015,
                 integrator=lateral_integrator, reset_integrator=False,
+                plug_to_gripper_override=plug_offset_ref,
             )
             step(ZERO_ACTION, target_pos=tp, target_quat_wxyz=tq)
         except TransformException:
@@ -1236,6 +1372,27 @@ def main():
         help="Optional RNG seed for reproducible noise profiles.",
     )
     ap.add_argument(
+        "--no-settle", action="store_true",
+        help=(
+            "Disable the pre-approach cable-settle step. With this flag, "
+            "compute_target_pose uses the live plug<->gripper offset every "
+            "tick (old behavior). The old path has a positive-feedback "
+            "drift when the cable bends — only use for A/B debugging."
+        ),
+    )
+    ap.add_argument(
+        "--settle-lift-m", type=float, default=0.15,
+        help="Meters to lift the gripper during the cable-settle ramp (default 0.15).",
+    )
+    ap.add_argument(
+        "--settle-lateral-abort-m", type=float, default=0.04,
+        help=(
+            "If the settled plug->gripper vector has a lateral magnitude "
+            "above this many meters, abort the attempt early as "
+            "'cable_bent_on_settle' (default 0.04). Pass 0 to disable."
+        ),
+    )
+    ap.add_argument(
         "--reset-scene", action="store_true",
         help=(
             "[BROKEN/EXPERIMENTAL] Was intended to call "
@@ -1311,6 +1468,7 @@ def main():
     discarded_collision = 0
     discarded_stuck = 0
     discarded_failed = 0
+    discarded_bent = 0
 
     rng = np.random.default_rng(args.seed)
 
@@ -1338,6 +1496,9 @@ def main():
                 max_time=args.max_episode_time,
                 noise_scale=args.noise_scale,
                 rng=rng,
+                settle_lift_m=args.settle_lift_m,
+                settle_lateral_abort_m=args.settle_lateral_abort_m,
+                freeze_plug_offset=not args.no_settle,
             )
 
             # Decision: save or discard
@@ -1349,6 +1510,8 @@ def main():
                     discarded_collision += 1
                 elif "stuck" in reason:
                     discarded_stuck += 1
+                elif "bent" in reason:
+                    discarded_bent += 1
 
             elif not ep.success:
                 logger.info(f"  FAILED: no insertion detected ({ep.duration:.1f}s)")
@@ -1415,6 +1578,7 @@ def main():
         logger.info(f"    High force:        {discarded_force}")
         logger.info(f"    Collision:         {discarded_collision}")
         logger.info(f"    Robot stuck:       {discarded_stuck}")
+        logger.info(f"    Cable bent:        {discarded_bent}")
         logger.info(f"{'='*60}")
 
         dataset.finalize()
