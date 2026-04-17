@@ -69,6 +69,11 @@ pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
   --num-episodes 1 --max-attempts 5 --exit-on-success --resume
 ```
 
+> **Noise is on by default** (`--noise-scale 1.0`) — each episode takes a
+> subtly different approach so the dataset isn't sterile. See
+> [Target-pose noise](auto_collection_guide.md#target-pose-noise). Disable
+> with `--noise-scale 0` if you want clean deterministic runs (debugging).
+
 > **After each successful episode:** Ctrl-C Gazebo, change `<CONFIG_PARAMS>` (or keep them to collect another ep of the same config), relaunch, rerun the `--resume` command.
 
 ### Terminal 3 (optional) — Watch insertion + force

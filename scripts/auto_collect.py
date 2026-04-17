@@ -667,6 +667,8 @@ def compute_target_pose(
     p_gain_lateral: float = 0.05,
     i_gain_lateral: float = 0.15,
     reset_integrator: bool = False,
+    lateral_noise_port_frame=None,
+    yaw_noise: float = 0.0,
 ):
     """
     Compute gripper target pose that aligns plug with port,
@@ -675,6 +677,19 @@ def compute_target_pose(
     If `integrator` is provided, applies CheatCode-style P+I correction on
     the plug's lateral (port-local XY) error. This is needed for reliable
     descent — without it, steady-state lateral offset causes insertion to jam.
+
+    If `lateral_noise_port_frame` is a 2-tuple ``(du, dv)`` in meters, the
+    final target is displaced by that offset expressed in the port's local
+    XY plane (u = port's local X axis, v = port's local Y axis). Use this
+    to synthesize "naturally imperfect" demonstrations — the P+I integrator
+    will still succeed (noise is small enough to fit the port's tolerance)
+    but the recorded velocity actions will contain micro-corrections that
+    clean expert demos lack.
+
+    If `yaw_noise` (radians) is non-zero, applies an additional rotation
+    around the port's insertion axis on top of the computed target quat.
+    Small values (|y| < 0.05 rad ~ 3°) look like imperfect wrist alignment
+    but don't break insertion.
     """
     port_tf = node.lookup_tf("base_link", port_frame)
     plug_tf = node.lookup_tf("base_link", plug_frame)
@@ -725,10 +740,25 @@ def compute_target_pose(
         )
 
     target_plug_pos = port_pos + insertion_axis * z_offset + lateral_correction
+
+    # Per-episode noise injected at the final target only; the integrator
+    # error signal above still uses the true port<->plug positions so the
+    # controller continues to converge correctly, but the commanded pose
+    # (and therefore the recorded velocity action) is perturbed.
+    if lateral_noise_port_frame is not None:
+        du, dv = lateral_noise_port_frame
+        target_plug_pos = target_plug_pos + lateral_u * float(du) + lateral_v * float(dv)
+
     target_gripper_pos = target_plug_pos + plug_to_gripper
 
     q_diff = quat_multiply(q_port, quat_conjugate(q_plug))
     q_gripper_target = quat_multiply(q_diff, q_gripper)
+
+    if yaw_noise != 0.0:
+        half = 0.5 * float(yaw_noise)
+        c, s = math.cos(half), math.sin(half)
+        q_yaw = (c, s * insertion_axis[0], s * insertion_axis[1], s * insertion_axis[2])
+        q_gripper_target = quat_multiply(q_yaw, q_gripper_target)
 
     return target_gripper_pos, q_gripper_target
 
@@ -871,8 +901,44 @@ class EpisodeResult:
     duration: float = 0.0
 
 
-def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
-    """Execute one insertion episode with full safety monitoring."""
+def _sample_noise_profile(rng, scale=1.0):
+    """Sample per-episode target-pose noise.
+
+    Ranges were chosen empirically:
+      * Approach: large enough that each episode visibly lands at a
+        different hover spot (±1 cm XY, ±2°). The integrator is disabled
+        during approach, so the noise persists until fine-align reaches it.
+      * Fine align: ±3 mm XY, ±1°. Inside the integrator's envelope so
+        the P+I correction will null it out over ~4 s — exactly the kind
+        of micro-correction signal the policy should learn.
+      * Insertion: ±1 mm XY. Inside the port's mechanical tolerance so
+        insertion still succeeds, but the descent trajectory shows small
+        non-zero lateral actions.
+      * Hold: 0. Clean seating for the final frames.
+
+    ``scale`` linearly multiplies every range; 0 disables noise entirely.
+    """
+    s = float(max(0.0, scale))
+
+    def u(lo, hi):
+        return float(rng.uniform(lo, hi)) * s
+
+    return {
+        "approach": np.array([u(-0.010, 0.010), u(-0.010, 0.010)]),
+        "approach_yaw": u(-math.radians(2.0), math.radians(2.0)),
+        "align":    np.array([u(-0.003, 0.003), u(-0.003, 0.003)]),
+        "align_yaw": u(-math.radians(1.0), math.radians(1.0)),
+        "insert":   np.array([u(-0.001, 0.001), u(-0.001, 0.001)]),
+    }
+
+
+def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
+                noise_scale: float = 1.0, rng: "np.random.Generator | None" = None):
+    """Execute one insertion episode with full safety monitoring.
+
+    ``noise_scale`` (0.0 disables) multiplies all per-phase target-pose
+    perturbations. See ``_sample_noise_profile`` for the sampling ranges.
+    """
     node.reset_episode_monitors()
     result = EpisodeResult()
     t0 = time.monotonic()
@@ -883,6 +949,23 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     stuck_samples: list = []
     # CheatCode-style lateral integrator (shared across phases for one episode)
     lateral_integrator = LateralIntegrator()
+
+    # Per-episode noise profile (sampled once, held constant for each phase).
+    # The integrator still drives toward the true port, but the commanded
+    # target is slightly offset — producing natural-looking micro-corrections
+    # in the recorded actions without compromising insertion success.
+    if rng is None:
+        rng = np.random.default_rng()
+    noise = _sample_noise_profile(rng, scale=noise_scale)
+    if noise_scale > 0:
+        logger.info(
+            f"  Noise profile (scale={noise_scale:.2f}):  "
+            f"approach dXY=({noise['approach'][0]*1000:+.1f},{noise['approach'][1]*1000:+.1f})mm "
+            f"dyaw={math.degrees(noise['approach_yaw']):+.2f}deg  |  "
+            f"align dXY=({noise['align'][0]*1000:+.1f},{noise['align'][1]*1000:+.1f})mm "
+            f"dyaw={math.degrees(noise['align_yaw']):+.2f}deg  |  "
+            f"insert dXY=({noise['insert'][0]*1000:+.1f},{noise['insert'][1]*1000:+.1f})mm"
+        )
 
     def step(action_dict, target_pos=None, target_quat_wxyz=None):
         """Record one frame; drive robot by POSE target (MODE_POSITION).
@@ -931,7 +1014,8 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
 
     def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False,
                   use_integrator=False, reset_integrator_first=False,
-                  interpolate_from_current=False, interpolate_steps=None):
+                  interpolate_from_current=False, interpolate_steps=None,
+                  lateral_noise=None, yaw_noise=0.0):
         """Run a control phase. Returns True if should continue, False if aborted/done.
 
         If `interpolate_from_current` is True, the FIRST `interpolate_steps`
@@ -939,6 +1023,10 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         target going from the current TCP pose to the final computed target.
         This avoids the impedance controller snapping to a distant target and
         slamming into obstacles.
+
+        ``lateral_noise`` (2-tuple, meters, port-local XY) and ``yaw_noise``
+        (radians, around port's insertion axis) are held constant throughout
+        this phase and passed to ``compute_target_pose``.
         """
         try:
             tp, _ = compute_target_pose(node, port_frame, plug_frame, z_offset=z_start)
@@ -975,6 +1063,8 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                     node, port_frame, plug_frame, z_offset=z,
                     integrator=lateral_integrator if use_integrator else None,
                     reset_integrator=(reset_integrator_first and i == 0),
+                    lateral_noise_port_frame=lateral_noise,
+                    yaw_noise=yaw_noise,
                 )
                 cur_pos, cur_quat = node.get_tcp_pose()
                 action, dist = compute_velocity_action(
@@ -1017,7 +1107,9 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     if not run_phase("Approach", z_start=0.12, z_end=0.12, gains=approach_gains,
                      max_steps=approach_steps, use_integrator=False,
                      interpolate_from_current=True,
-                     interpolate_steps=int(approach_steps * 0.75)):
+                     interpolate_steps=int(approach_steps * 0.75),
+                     lateral_noise=tuple(noise["approach"]),
+                     yaw_noise=noise["approach_yaw"]):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
@@ -1025,7 +1117,9 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     # Phase 2: Fine alignment — lower and correct lateral offset (I-gain on from here)
     fine_gains = ControllerGains(kp_linear=2.0, max_linear_vel=0.02, kp_angular=2.5, max_angular_vel=0.2)
     if not run_phase("Fine align", z_start=0.06, z_end=0.06, gains=fine_gains,
-                     max_steps=fps * 4, use_integrator=True, reset_integrator_first=True):
+                     max_steps=fps * 4, use_integrator=True, reset_integrator_first=True,
+                     lateral_noise=tuple(noise["align"]),
+                     yaw_noise=noise["align_yaw"]):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
@@ -1036,7 +1130,9 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         kp_angular=2.5, max_angular_vel=0.15,
     )
     if not run_phase("Insertion", z_start=0.06, z_end=-0.015, gains=insert_gains,
-                     max_steps=fps * 12, is_insertion=True, use_integrator=True):
+                     max_steps=fps * 12, is_insertion=True, use_integrator=True,
+                     lateral_noise=tuple(noise["insert"]),
+                     yaw_noise=0.0):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
@@ -1125,6 +1221,21 @@ def main():
     ap.add_argument("--discard-high-force", action="store_true",
                     help="Discard episodes where force exceeded scoring threshold for >1s")
     ap.add_argument(
+        "--noise-scale", type=float, default=1.0,
+        help=(
+            "Scale factor for per-episode target-pose noise (default 1.0). "
+            "Injects small per-phase XY + yaw offsets to the commanded "
+            "target so each episode takes a subtly different approach and "
+            "the P+I integrator produces natural micro-corrections. "
+            "Approach: ±1 cm XY, ±2°. Align: ±3 mm XY, ±1°. Insertion: "
+            "±1 mm XY. Hold: clean. Pass 0 to disable."
+        ),
+    )
+    ap.add_argument(
+        "--seed", type=int, default=None,
+        help="Optional RNG seed for reproducible noise profiles.",
+    )
+    ap.add_argument(
         "--reset-scene", action="store_true",
         help=(
             "[BROKEN/EXPERIMENTAL] Was intended to call "
@@ -1201,6 +1312,8 @@ def main():
     discarded_stuck = 0
     discarded_failed = 0
 
+    rng = np.random.default_rng(args.seed)
+
     logger.info(f"=== Starting collection: {args.num_episodes} episodes, max {args.max_attempts} attempts ===")
 
     if args.reset_scene:
@@ -1223,6 +1336,8 @@ def main():
                 plug_frame=args.plug_frame,
                 fps=args.fps,
                 max_time=args.max_episode_time,
+                noise_scale=args.noise_scale,
+                rng=rng,
             )
 
             # Decision: save or discard

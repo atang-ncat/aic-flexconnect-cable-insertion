@@ -152,7 +152,43 @@ rm -rf /scratch2/atang/ws_aic/teleop-automated-dataset/sfp_test
 | `--max-episode-time` | 60.0 | Max seconds per attempt |
 | `--discard-high-force` | false | Discard episodes where force > 20 N for > 1s |
 | `--exit-on-success` | false | Stop as soon as one episode is saved. Recommended for the per-launch workflow below. |
+| `--noise-scale` | 1.0 | Scales per-episode target-pose noise. See [Target-pose noise](#target-pose-noise). Pass `0` to disable. |
+| `--seed` | (none) | Optional RNG seed for reproducible noise profiles. |
 | `--reset-scene` | false | **No-op / broken.** Calling `/gz_server/reset_simulation` on this build crashes the `ros_gz_container` (ros2_control reloads inside the same process and segfaults). Flag is accepted for backward compatibility only. |
+
+## Target-pose noise
+
+Without any noise, the CheatCode expert produces trajectories that are nearly
+identical episode-to-episode: the plug descends in a clean straight line with
+minimal lateral action. That's mechanically perfect but makes the resulting
+dataset *too sterile* — a policy trained only on these clean runs has never
+seen a micro-correction and gets brittle when it ends up in a state slightly
+off the demonstrated trajectory.
+
+`--noise-scale` (default **1.0**) injects small per-phase perturbations into
+the commanded target pose. Each episode samples one offset per phase, holds
+it constant through that phase, and logs the values at the start of the
+attempt. The lateral P+I integrator still references the **true** port
+position, so it naturally corrects against the biased target — producing
+realistic micro-corrections in the recorded velocity actions.
+
+Ranges at `--noise-scale 1.0`:
+
+| Phase | Lateral XY | Yaw (around insertion axis) |
+|-------|------------|-----------------------------|
+| Approach | ±10 mm | ±2° |
+| Fine align | ±3 mm | ±1° |
+| Insertion | ±1 mm | 0 |
+| Hold | 0 | 0 |
+
+Values are small enough that insertion still succeeds (well within the port's
+mechanical tolerance), but large enough that each trajectory looks subtly
+different and the recorded `linear.x / linear.y / angular.z` actions have
+visible variance instead of being dead-zero most of the time.
+
+Pass `--noise-scale 0` to reproduce the old deterministic behavior (useful for
+debugging). Pass `--seed 42` along with it to get a reproducible profile
+across identical configs.
 
 ## Recommended workflow: one episode per Gazebo launch
 
