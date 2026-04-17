@@ -313,8 +313,22 @@ class AICRobotAICController(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if not self.last_controller_state or not self.last_joint_states:
-            return {}
+        timeout_sec = 10.0
+        poll_interval = 0.1
+        waited = 0.0
+        while not self.last_controller_state or not self.last_joint_states:
+            if waited >= timeout_sec:
+                missing = []
+                if not self.last_controller_state:
+                    missing.append("/aic_controller/controller_state")
+                if not self.last_joint_states:
+                    missing.append("/joint_states")
+                raise TimeoutError(
+                    f"Timed out after {timeout_sec}s waiting for ROS messages on: {', '.join(missing)}. "
+                    "Is the aic_controller active? (launch with activate_joint_controller:=true)"
+                )
+            time.sleep(poll_interval)
+            waited += poll_interval
 
         tcp_pose = self.last_controller_state.tcp_pose
         tcp_velocity = self.last_controller_state.tcp_velocity

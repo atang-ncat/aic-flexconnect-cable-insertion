@@ -42,6 +42,16 @@ class CheatCode(Policy):
         self._task = None
         super().__init__(parent_node)
 
+    @staticmethod
+    def _quat_to_rotmat(q_wxyz):
+        """Convert quaternion (w,x,y,z) to 3x3 rotation matrix."""
+        w, x, y, z = q_wxyz
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y-w*z),   2*(x*z+w*y)],
+            [2*(x*y+w*z),   1-2*(x*x+z*z), 2*(y*z-w*x)],
+            [2*(x*z-w*y),   2*(y*z+w*x),   1-2*(x*x+y*y)],
+        ])
+
     def _wait_for_tf(
         self, target_frame: str, source_frame: str, timeout_sec: float = 10.0
     ) -> bool:
@@ -77,7 +87,11 @@ class CheatCode(Policy):
         z_offset: float = 0.1,
         reset_xy_integrator: bool = False,
     ) -> Pose:
-        """Find the gripper pose that results in plug alignment."""
+        """Find the gripper pose that results in plug alignment.
+
+        Uses the port's orientation to determine the insertion axis,
+        so this works for ports at any angle (SFP vertical, SC horizontal, etc.).
+        """
         q_port = (
             port_transform.rotation.w,
             port_transform.rotation.x,
@@ -116,65 +130,77 @@ class CheatCode(Policy):
         q_gripper_target = quaternion_multiply(q_diff, q_gripper)
         q_gripper_slerp = quaternion_slerp(q_gripper, q_gripper_target, slerp_fraction)
 
-        gripper_xyz = (
+        # Positions as numpy arrays
+        gripper_pos = np.array([
             gripper_tf_stamped.transform.translation.x,
             gripper_tf_stamped.transform.translation.y,
             gripper_tf_stamped.transform.translation.z,
-        )
-        port_xy = (
+        ])
+        port_pos = np.array([
             port_transform.translation.x,
             port_transform.translation.y,
-        )
-        plug_xyz = (
+            port_transform.translation.z,
+        ])
+        plug_pos = np.array([
             plug_tf_stamped.transform.translation.x,
             plug_tf_stamped.transform.translation.y,
             plug_tf_stamped.transform.translation.z,
-        )
-        plug_tip_gripper_offset = (
-            gripper_xyz[0] - plug_xyz[0],
-            gripper_xyz[1] - plug_xyz[1],
-            gripper_xyz[2] - plug_xyz[2],
-        )
+        ])
 
-        tip_x_error = port_xy[0] - plug_xyz[0]
-        tip_y_error = port_xy[1] - plug_xyz[1]
+        # Port's local axes in world frame
+        R_port = self._quat_to_rotmat(q_port)
+        insertion_axis = R_port[:, 2]  # port local Z = approach direction
+        lateral_u = R_port[:, 0]       # port local X
+        lateral_v = R_port[:, 1]       # port local Y
+
+        # Plug-to-gripper offset (we need this to command the gripper to place the plug)
+        plug_to_gripper = gripper_pos - plug_pos
+
+        # Lateral errors in the port's local frame
+        error_vec = port_pos - plug_pos
+        u_error = float(np.dot(error_vec, lateral_u))
+        v_error = float(np.dot(error_vec, lateral_v))
 
         if reset_xy_integrator:
             self._tip_x_error_integrator = 0.0
             self._tip_y_error_integrator = 0.0
         else:
             self._tip_x_error_integrator = np.clip(
-                self._tip_x_error_integrator + tip_x_error,
+                self._tip_x_error_integrator + u_error,
                 -self._max_integrator_windup,
                 self._max_integrator_windup,
             )
             self._tip_y_error_integrator = np.clip(
-                self._tip_y_error_integrator + tip_y_error,
+                self._tip_y_error_integrator + v_error,
                 -self._max_integrator_windup,
                 self._max_integrator_windup,
             )
 
         self.get_logger().info(
-            f"pfrac: {position_fraction:.3} xy_error: {tip_x_error:0.3} {tip_y_error:0.3}   integrators: {self._tip_x_error_integrator:.3} , {self._tip_y_error_integrator:.3}"
+            f"pfrac: {position_fraction:.3} uv_error: {u_error:0.3} {v_error:0.3}   integrators: {self._tip_x_error_integrator:.3} , {self._tip_y_error_integrator:.3}"
         )
 
         i_gain = 0.15
+        p_gain = 0.05  # Added proportional gain for immediate correction
 
-        target_x = port_xy[0] + i_gain * self._tip_x_error_integrator
-        target_y = port_xy[1] + i_gain * self._tip_y_error_integrator
-        target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset[2]
-
-        blend_xyz = (
-            position_fraction * target_x + (1.0 - position_fraction) * gripper_xyz[0],
-            position_fraction * target_y + (1.0 - position_fraction) * gripper_xyz[1],
-            position_fraction * target_z + (1.0 - position_fraction) * gripper_xyz[2],
+        # We want the plug tip to reach this ideal position:
+        target_plug_pos = (
+            port_pos
+            + insertion_axis * z_offset
+            + lateral_u * (p_gain * u_error + i_gain * self._tip_x_error_integrator)
+            + lateral_v * (p_gain * v_error + i_gain * self._tip_y_error_integrator)
         )
+
+        # To place the plug at target_plug_pos, the gripper must be offset appropriately
+        target_gripper_pos = target_plug_pos + plug_to_gripper
+
+        blend = position_fraction * target_gripper_pos + (1.0 - position_fraction) * gripper_pos
 
         return Pose(
             position=Point(
-                x=blend_xyz[0],
-                y=blend_xyz[1],
-                z=blend_xyz[2],
+                x=float(blend[0]),
+                y=float(blend[1]),
+                z=float(blend[2]),
             ),
             orientation=Quaternion(
                 w=q_gripper_slerp[0],
