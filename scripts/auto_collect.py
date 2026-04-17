@@ -665,7 +665,7 @@ def compute_target_pose(
     z_offset=0.1,
     integrator: "LateralIntegrator | None" = None,
     p_gain_lateral: float = 0.05,
-    i_gain_lateral: float = 0.15,
+    i_gain_lateral: float = 0.05,
     reset_integrator: bool = False,
 ):
     """
@@ -731,6 +731,103 @@ def compute_target_pose(
     q_gripper_target = quat_multiply(q_diff, q_gripper)
 
     return target_gripper_pos, q_gripper_target
+
+
+def compute_pose_diagnostics(
+    node, port_frame, plug_frame, cur_pos, target_pos
+):
+    """Snapshot of *why* an insertion attempt is or isn't progressing.
+
+    All linear values are in meters and decomposed in the port frame:
+      * +Z (`port_axis`) is the insertion direction (positive = above the
+        port face, ie. not yet inserted).
+      * X/Y are in-plane.
+
+    Returned fields:
+      plug_axial_m       : plug tip along port +Z. Negative means seated.
+      plug_lat_m         : plug tip distance to the port insertion axis.
+      plug_yaw_deg       : rotation of the plug frame about port +Z relative
+                           to the port frame. Critical for SFP because the
+                           connector body is keyed.
+      plug_tilt_deg      : angle between plug +Z and port +Z. Non-zero means
+                           the plug is not pointed straight into the port.
+      grip_track_axial_m : (cur_gripper - cmd_gripper) along port +Z. Tells
+                           us if the impedance controller is lagging the
+                           commanded pose along the insertion axis.
+      grip_track_lat_m   : same but lateral. Lag in this direction hints
+                           that lateral correction is being absorbed by
+                           tracking error rather than by plug motion.
+      cable_lat_m        : lateral component of (plug - gripper) in port
+                           frame. Big values = the cable is bending sideways
+                           between the gripper jaws and the SFP plug tip.
+    """
+    port_tf = node.lookup_tf("base_link", port_frame)
+    plug_tf = node.lookup_tf("base_link", plug_frame)
+    port_pos = np.array([
+        port_tf.transform.translation.x,
+        port_tf.transform.translation.y,
+        port_tf.transform.translation.z,
+    ])
+    plug_pos = np.array([
+        plug_tf.transform.translation.x,
+        plug_tf.transform.translation.y,
+        plug_tf.transform.translation.z,
+    ])
+    q_port = (
+        port_tf.transform.rotation.w, port_tf.transform.rotation.x,
+        port_tf.transform.rotation.y, port_tf.transform.rotation.z,
+    )
+    q_plug = (
+        plug_tf.transform.rotation.w, plug_tf.transform.rotation.x,
+        plug_tf.transform.rotation.y, plug_tf.transform.rotation.z,
+    )
+    R_port = quat_to_rotmat(q_port)
+    R_plug = quat_to_rotmat(q_plug)
+    port_axis = R_port[:, 2]
+
+    delta = plug_pos - port_pos
+    plug_axial = float(np.dot(delta, port_axis))
+    plug_lat = float(np.linalg.norm(delta - plug_axial * port_axis))
+
+    plug_axis = R_plug[:, 2]
+    cos_tilt = float(np.clip(np.dot(plug_axis, port_axis), -1.0, 1.0))
+    plug_tilt_deg = math.degrees(math.acos(cos_tilt))
+
+    # Yaw: express plug rotation in the port frame and read the rotation
+    # about the port +Z axis. This is well-defined when tilt is small.
+    R_in_port = R_port.T @ R_plug
+    plug_yaw_deg = math.degrees(math.atan2(R_in_port[1, 0], R_in_port[0, 0]))
+
+    grip_err = cur_pos - target_pos
+    grip_track_axial = float(np.dot(grip_err, port_axis))
+    grip_track_lat = float(np.linalg.norm(grip_err - grip_track_axial * port_axis))
+
+    plug_grip_vec = plug_pos - cur_pos
+    plug_grip_axial = float(np.dot(plug_grip_vec, port_axis))
+    cable_lat = float(np.linalg.norm(plug_grip_vec - plug_grip_axial * port_axis))
+
+    return {
+        "plug_axial_m": plug_axial,
+        "plug_lat_m": plug_lat,
+        "plug_yaw_deg": plug_yaw_deg,
+        "plug_tilt_deg": plug_tilt_deg,
+        "grip_track_axial_m": grip_track_axial,
+        "grip_track_lat_m": grip_track_lat,
+        "cable_lat_m": cable_lat,
+    }
+
+
+def format_diag_line(d, prefix="    "):
+    """Render `compute_pose_diagnostics` output as a one-line log message."""
+    return (
+        f"{prefix}plug ax={d['plug_axial_m']*1000:+6.1f}mm "
+        f"lat={d['plug_lat_m']*1000:5.1f}mm "
+        f"yaw={d['plug_yaw_deg']:+6.1f}deg "
+        f"tilt={d['plug_tilt_deg']:5.1f}deg | "
+        f"grip-trk ax={d['grip_track_axial_m']*1000:+6.1f}mm "
+        f"lat={d['grip_track_lat_m']*1000:5.1f}mm | "
+        f"cable-lat={d['cable_lat_m']*1000:5.1f}mm"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -931,7 +1028,10 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
 
     def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False,
                   use_integrator=False, reset_integrator_first=False,
-                  interpolate_from_current=False, interpolate_steps=None):
+                  interpolate_from_current=False, interpolate_steps=None,
+                  require_lateral_m=None, require_axial_above_m=None,
+                  converge_hold_s=0.3, converge_log_every_s=1.0,
+                  diag_log_every_s=2.0):
         """Run a control phase. Returns True if should continue, False if aborted/done.
 
         If `interpolate_from_current` is True, the FIRST `interpolate_steps`
@@ -939,6 +1039,22 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         target going from the current TCP pose to the final computed target.
         This avoids the impedance controller snapping to a distant target and
         slamming into obstacles.
+
+        If `require_lateral_m` and/or `require_axial_above_m` are set, the
+        phase holds z constant (z_start) and exits *early* when all set
+        conditions have held simultaneously for `converge_hold_s` seconds:
+          * plug_lat   < require_lateral_m        (plug over slot axis)
+          * plug_axial > require_axial_above_m    (plug above card face)
+        If `max_steps` is exhausted without convergence, the attempt is
+        aborted with a "<condition> not converged (...)" reason. This
+        prevents descending into the card while the plug is still off-
+        axis or already dangling past the card edge \u2014 both are
+        permanently-stuck failure modes.
+
+        For any phase, a one-line pose diagnostic (axial/lateral/yaw/tilt)
+        is logged every `diag_log_every_s` seconds (except during Insertion,
+        which logs its own richer every-0.5s message, and during
+        convergence-gated phases, which log their own every-1s message).
         """
         try:
             tp, _ = compute_target_pose(node, port_frame, plug_frame, z_offset=z_start)
@@ -959,6 +1075,14 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         if interpolate_from_current:
             start_pos, start_quat = node.get_tcp_pose()
             ramp_steps = interpolate_steps if interpolate_steps else max_steps
+
+        gated = (require_lateral_m is not None) or (require_axial_above_m is not None)
+        converge_ticks = 0
+        converge_ticks_needed = max(1, int(round(fps * converge_hold_s)))
+        converge_log_every_ticks = max(1, int(round(fps * converge_log_every_s)))
+        diag_log_every_ticks = max(1, int(round(fps * diag_log_every_s)))
+        last_plug_lat = None     # for post-mortem in abort reason
+        last_plug_axial = None
 
         for i, z in enumerate(z_values):
             if node.insertion_detected.is_set():
@@ -989,14 +1113,91 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                     cmd_pos, cmd_quat = target_pos, target_quat
                 step(action, target_pos=cmd_pos, target_quat_wxyz=cmd_quat)
 
-                # Log force periodically during insertion phase
-                if is_insertion and i % (fps * 2) == 0:
+                # Log force + pose diagnostics every ~0.5s during insertion.
+                # The diagnostics tell us *which dimension* the plug is stuck
+                # in (axial vs lateral vs yaw vs tilt) and whether the gripper
+                # itself is lagging the commanded pose.
+                if is_insertion and i % max(1, fps // 2) == 0:
                     fs = node.get_force_stats()
-                    logger.info(f"    z={z:.4f} dist={dist:.4f}m force={fs['current']:.1f}N "
-                                f"(max={fs['max']:.1f}N)")
+                    try:
+                        d = compute_pose_diagnostics(
+                            node, port_frame, plug_frame, cur_pos, target_pos
+                        )
+                        logger.info(
+                            f"    z={z:+.4f} dist={dist:.4f}m "
+                            f"force={fs['current']:.1f}N (max={fs['max']:.1f}N)"
+                        )
+                        logger.info(format_diag_line(d))
+                    except TransformException:
+                        logger.info(
+                            f"    z={z:.4f} dist={dist:.4f}m "
+                            f"force={fs['current']:.1f}N (max={fs['max']:.1f}N)"
+                        )
+
+                # Two-axis gating: only unlock the next phase once the plug
+                # is simultaneously over the slot (lateral) AND above the
+                # card face (axial). Either alone is insufficient: we
+                # learned the hard way that the plug can be laterally
+                # centred while hanging 46 mm past the card edge.
+                if gated:
+                    try:
+                        _, plug_axial, plug_lat = node.plug_to_port_distance(
+                            port_frame, plug_frame
+                        )
+                        last_plug_lat = plug_lat
+                        last_plug_axial = plug_axial
+                        lat_ok = (
+                            require_lateral_m is None
+                            or plug_lat < require_lateral_m
+                        )
+                        ax_ok = (
+                            require_axial_above_m is None
+                            or plug_axial > require_axial_above_m
+                        )
+                        if lat_ok and ax_ok:
+                            converge_ticks += 1
+                        else:
+                            converge_ticks = 0
+                        if i % converge_log_every_ticks == 0:
+                            want = []
+                            if require_lateral_m is not None:
+                                want.append(f"lat<{require_lateral_m*1000:.1f}mm")
+                            if require_axial_above_m is not None:
+                                want.append(f"ax>{require_axial_above_m*1000:+.1f}mm")
+                            logger.info(
+                                f"    lateral={plug_lat*1000:5.1f}mm "
+                                f"axial={plug_axial*1000:+6.1f}mm "
+                                f"(want {' & '.join(want)} for "
+                                f"{converge_hold_s:.1f}s)"
+                            )
+                        if converge_ticks >= converge_ticks_needed:
+                            logger.info(
+                                f"    Converged: "
+                                f"lateral={plug_lat*1000:.2f}mm "
+                                f"axial={plug_axial*1000:+.2f}mm "
+                                f"sustained {converge_hold_s:.1f}s"
+                            )
+                            return True
+                    except TransformException:
+                        pass
+                elif not is_insertion and i % diag_log_every_ticks == 0:
+                    # Generic diagnostics for ungated non-insertion phases
+                    # (currently: Approach). Gives visibility into where
+                    # the plug is as we move toward the port.
+                    try:
+                        d = compute_pose_diagnostics(
+                            node, port_frame, plug_frame, cur_pos, target_pos
+                        )
+                        logger.info(format_diag_line(d))
+                    except TransformException:
+                        pass
 
                 # Early convergence for approach/alignment phases
-                if not is_insertion and dist < 0.003:
+                if (
+                    not is_insertion
+                    and not gated
+                    and dist < 0.003
+                ):
                     logger.info(f"    Converged (dist={dist:.4f}m)")
                     break
 
@@ -1005,38 +1206,96 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                 step(ZERO_ACTION)
 
             time.sleep(1.0 / fps)
+
+        # Reached here => the loop ended without early-exit. For gated
+        # phases that's a failure: descending past the card with a still-
+        # misaligned plug would jam it in the outside-the-slot dead zone.
+        if gated:
+            parts = []
+            if require_lateral_m is not None:
+                parts.append(
+                    f"lat={last_plug_lat*1000:.1f}mm>"
+                    f"{require_lateral_m*1000:.1f}mm"
+                    if last_plug_lat is not None else "lat=?"
+                )
+            if require_axial_above_m is not None:
+                parts.append(
+                    f"ax={last_plug_axial*1000:+.1f}mm<"
+                    f"{require_axial_above_m*1000:+.1f}mm"
+                    if last_plug_axial is not None else "ax=?"
+                )
+            result.aborted = True
+            result.abort_reason = (
+                f"alignment not converged ({', '.join(parts)} after "
+                f"{max_steps/fps:.1f}s)"
+            )
+            return False
+
         return True
 
-    # Phase 1: Approach — move above port.
-    # CheatCode-style smooth interpolation from the CURRENT TCP pose to the
-    # above-port target over the full phase (~8s at 30Hz). This handles both
-    # the first-attempt startup (arm may be ~25cm from target) and recovery
-    # from earlier attempts (arm may be jammed against the board).
+    # Phase 1: Approach — lift the plug clear of the card face.
+    #
+    # The cable from gripper/tcp to cable_0/sfp_tip_link is ~20 cm long,
+    # so for the plug to end up above the port face the gripper itself
+    # has to be held roughly 22 cm above the port (plug dangles below
+    # gripper by ~cable length under gravity). An Approach that only
+    # aims at z_offset=0.12 leaves the gripper ~10 cm too low and the
+    # plug hangs ~45 mm *past* the card edge for the entire phase.
+    #
+    # We raise the target to z_offset=0.22 and gate Approach on
+    # plug_axial > +10 mm (sustained 0.3 s). This way Fine align only
+    # starts once the plug has already cleared the card face; before
+    # that happens there is nothing useful Fine align can do anyway.
+    # If the plug never climbs above the card within 15 s we abort
+    # and retry from scratch rather than wedge it against the edge.
     approach_gains = ControllerGains(kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3)
-    approach_steps = fps * 8
-    if not run_phase("Approach", z_start=0.12, z_end=0.12, gains=approach_gains,
+    approach_steps = fps * 15
+    if not run_phase("Approach", z_start=0.22, z_end=0.22, gains=approach_gains,
                      max_steps=approach_steps, use_integrator=False,
                      interpolate_from_current=True,
-                     interpolate_steps=int(approach_steps * 0.75)):
+                     interpolate_steps=int(approach_steps * 0.6),
+                     require_axial_above_m=0.010,
+                     converge_hold_s=0.3,
+                     diag_log_every_s=2.0):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
 
-    # Phase 2: Fine alignment — lower and correct lateral offset (I-gain on from here)
+    # Phase 2: Fine alignment — hold a safe height ABOVE the port face and
+    # wait until the plug is simultaneously laterally over the slot AND
+    # axially above the card face before allowing any descent.
+    #
+    # Held height is z_offset=0.10 (plug target at +10 cm, gripper
+    # target at +30 cm given the ~20 cm cable). This keeps the plug
+    # well above the card while the lateral P+I settles it over the
+    # slot axis. Descending from a plug that is already past the card
+    # edge is unrecoverable, so we refuse to start Insertion unless
+    # both gates are satisfied.
+    #
+    # Thresholds:
+    #   require_lateral_m=0.003 — roughly half the SFP slot width, giving
+    #     clearance for the plug tip to enter the slot rather than next to it.
+    #   require_axial_above_m=0.005 — plug must be at least 5 mm above the
+    #     port face so that "lower to 0" actually sends the plug into the slot.
     fine_gains = ControllerGains(kp_linear=2.0, max_linear_vel=0.02, kp_angular=2.5, max_angular_vel=0.2)
-    if not run_phase("Fine align", z_start=0.06, z_end=0.06, gains=fine_gains,
-                     max_steps=fps * 4, use_integrator=True, reset_integrator_first=True):
+    if not run_phase("Fine align", z_start=0.10, z_end=0.10, gains=fine_gains,
+                     max_steps=fps * 10, use_integrator=True, reset_integrator_first=True,
+                     require_lateral_m=0.003, require_axial_above_m=0.005,
+                     converge_hold_s=0.3):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
 
-    # Phase 3: Insertion descent — slow, force-aware, integrator still active
+    # Phase 3: Insertion descent — slow, force-aware, integrator still active.
+    # Starts at z_offset=0.10 (matching Fine align hold) and ramps to
+    # -0.015 over 15 s (~7.7 mm/s target-plug descent, which matches
+    # the insertion_linear_vel cap).
     insert_gains = ControllerGains(
         kp_linear=2.0, max_linear_vel=0.01, insertion_linear_vel=0.008,
         kp_angular=2.5, max_angular_vel=0.15,
     )
-    if not run_phase("Insertion", z_start=0.06, z_end=-0.015, gains=insert_gains,
-                     max_steps=fps * 12, is_insertion=True, use_integrator=True):
+    if not run_phase("Insertion", z_start=0.10, z_end=-0.015, gains=insert_gains,
+                     max_steps=fps * 15, is_insertion=True, use_integrator=True):
         node.stop_robot()
         result.duration = time.monotonic() - t0
         return result
@@ -1053,6 +1312,7 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     tf_success = False
     tf_success_streak = 0  # require a few consecutive matches to avoid flicker
     hold_start = time.monotonic()
+    hold_tick = 0
     while time.monotonic() - hold_start < hold_seconds:
         if node.insertion_detected.is_set():
             break
@@ -1085,6 +1345,28 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                 tf_success_streak = 0
         except TransformException:
             pass
+
+        # 1Hz diagnostic snapshot during Hold so we can see how the plug
+        # evolves during the press (does it slowly seat? does it slip
+        # sideways? does the gripper give up tracking?).
+        if hold_tick % max(1, fps) == 0:
+            try:
+                cur_pos_h, _ = node.get_tcp_pose()
+                tp_h, _ = compute_target_pose(
+                    node, port_frame, plug_frame, z_offset=-0.015,
+                )
+                d = compute_pose_diagnostics(
+                    node, port_frame, plug_frame, cur_pos_h, tp_h
+                )
+                fs = node.get_force_stats()
+                logger.info(
+                    f"    [hold {hold_tick // max(1, fps)}s] "
+                    f"force={fs['current']:.1f}N (max={fs['max']:.1f}N)"
+                )
+                logger.info(format_diag_line(d))
+            except TransformException:
+                pass
+        hold_tick += 1
 
         time.sleep(1.0 / fps)
 
@@ -1200,6 +1482,7 @@ def main():
     discarded_collision = 0
     discarded_stuck = 0
     discarded_failed = 0
+    discarded_lateral = 0
 
     logger.info(f"=== Starting collection: {args.num_episodes} episodes, max {args.max_attempts} attempts ===")
 
@@ -1234,6 +1517,8 @@ def main():
                     discarded_collision += 1
                 elif "stuck" in reason:
                     discarded_stuck += 1
+                elif "alignment not converged" in reason:
+                    discarded_lateral += 1
 
             elif not ep.success:
                 logger.info(f"  FAILED: no insertion detected ({ep.duration:.1f}s)")
@@ -1275,7 +1560,14 @@ def main():
                     )
                     break
             else:
-                dataset.clear_episode_buffer()
+                # Only clear if the buffer was actually populated. Early
+                # aborts (e.g. "robot stuck" fires during the first Approach
+                # tick, before any frame is recorded) leave
+                # dataset.episode_buffer as None, and
+                # LeRobotDataset.clear_episode_buffer() crashes on
+                # episode_buffer["episode_index"] if called then.
+                if getattr(dataset, "episode_buffer", None) is not None:
+                    dataset.clear_episode_buffer()
 
             # Between failed attempts within the same launch: lift straight
             # up by 15 cm so that
@@ -1296,10 +1588,11 @@ def main():
         logger.info(f"  Total attempts:      {attempts}")
         logger.info(f"  Success rate:        {100*successes/max(attempts,1):.0f}%")
         logger.info(f"  Discarded breakdown:")
-        logger.info(f"    Insertion failed:  {discarded_failed}")
-        logger.info(f"    High force:        {discarded_force}")
-        logger.info(f"    Collision:         {discarded_collision}")
-        logger.info(f"    Robot stuck:       {discarded_stuck}")
+        logger.info(f"    Insertion failed:    {discarded_failed}")
+        logger.info(f"    Alignment not conv.: {discarded_lateral}")
+        logger.info(f"    High force:          {discarded_force}")
+        logger.info(f"    Collision:           {discarded_collision}")
+        logger.info(f"    Robot stuck:         {discarded_stuck}")
         logger.info(f"{'='*60}")
 
         dataset.finalize()
