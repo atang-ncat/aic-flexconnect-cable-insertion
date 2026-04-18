@@ -1254,12 +1254,23 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     # aims at z_offset=0.12 leaves the gripper ~10 cm too low and the
     # plug hangs ~45 mm *past* the card edge for the entire phase.
     #
-    # We raise the target to z_offset=0.22 and gate Approach on
-    # plug_axial > +10 mm (sustained 0.3 s). This way Fine align only
-    # starts once the plug has already cleared the card face; before
-    # that happens there is nothing useful Fine align can do anyway.
-    # If the plug never climbs above the card within 15 s we abort
-    # and retry from scratch rather than wedge it against the edge.
+    # We raise the target to z_offset=0.22 and gate Approach on BOTH
+    # plug_axial > +10 mm AND plug_lat < 10 mm (sustained 0.3 s). This
+    # way Fine align only starts once the plug has cleared the card
+    # face axially AND is within ~10 mm of the port axis laterally —
+    # so the z=0.10 descent in Fine align doesn't immediately crash
+    # the plug into the card edge.
+    #
+    # The lateral gate is critical for distant NIC slots (2-4), where
+    # the home pose leaves the plug 95-170 mm laterally off-center.
+    # Without it, Approach exits on axial alone with ~35 mm residual
+    # lateral, Fine align drops to z=0.10, and the plug slams the
+    # card edge -> force spike + off-limit collision. With the gate
+    # we give the P+I 25 s (was 15 s) to bring lateral under 10 mm
+    # while holding the safe z=0.22 height. Slots 0-1 are unaffected
+    # because they already satisfy the gate long before the budget
+    # runs out.
+    #
     # Straight-line Cartesian interpolation from the current TCP pose
     # to port+0.22 in port frame. See run_phase() for the lift-waypoint
     # machinery that's available but not used here: two independent
@@ -1270,12 +1281,13 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     # a sketch of the proper fix (joint-space "go-home" pose before
     # Approach, to guarantee a deterministic starting configuration).
     approach_gains = ControllerGains(kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3)
-    approach_steps = fps * 15
+    approach_steps = fps * 25
     if not run_phase("Approach", z_start=0.22, z_end=0.22, gains=approach_gains,
                      max_steps=approach_steps, use_integrator=False,
                      interpolate_from_current=True,
                      interpolate_steps=int(approach_steps * 0.6),
                      require_axial_above_m=0.010,
+                     require_lateral_m=0.010,
                      converge_hold_s=0.3,
                      diag_log_every_s=2.0):
         node.stop_robot()
