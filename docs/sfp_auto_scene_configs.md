@@ -36,6 +36,38 @@ Same eval axes as the teleop doc — `nic_card_mount_{0..4}_{present,translation
 
 See [`auto_collection_guide.md`](auto_collection_guide.md) for full details.
 
+### Automated: one command, all 40 configs
+
+For anything beyond a single-config smoke test, use the multi-config
+wrapper — it drives `collect_many.sh` once per row of
+[`scripts/sfp_auto_configs.tsv`](../scripts/sfp_auto_configs.tsv)
+(which mirrors the tables below) and writes per-config debug logs
+plus a running `summary.tsv` under `/tmp/collect_multi_logs/`:
+
+```bash
+source ~/lab/ws_aic/setup_dev.sh
+
+# Peek at the plan without launching Gazebo:
+scripts/collect_multi_config.sh --dry-run
+
+# Collect a single group (e.g. all 5 rail slots = 15 episodes):
+scripts/collect_multi_config.sh --group A
+
+# Full 120-episode sweep:
+scripts/collect_multi_config.sh
+
+# Resume mid-sweep (e.g. after a crash or Ctrl-C):
+scripts/collect_multi_config.sh --start-at C.3
+
+# Watch live progress from a second terminal:
+tail -f /tmp/collect_multi_logs/summary.tsv
+```
+
+Per-config Gazebo + auto_collect logs land in
+`/tmp/collect_multi_logs/<CONFIG_ID>/` so you can debug a specific
+failure after the sweep finishes. The manual recipe below is still
+the way to iterate on a single config.
+
 ### Terminal 1 — Launch the scene
 
 Replace `<CONFIG_PARAMS>` with the per-config parameters in the tables below.

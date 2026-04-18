@@ -54,7 +54,9 @@ FORCE_THRESHOLD_N=20.0
 FORCE_PENALTY_DWELL_S=1.0
 
 # Where per-episode auto_collect logs get captured (for force stat extraction).
-EP_LOG_DIR="/tmp/collect_many_logs"
+# Can be overridden via the EP_LOG_DIR env var (used by collect_multi_config.sh
+# to redirect each config's episode logs into its own subdirectory).
+EP_LOG_DIR="${EP_LOG_DIR:-/tmp/collect_many_logs}"
 
 usage() {
     cat <<'EOF'
