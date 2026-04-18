@@ -236,6 +236,21 @@ for ((ep=1; ep<=EPISODES; ep++)); do
     EP_LOG="$EP_LOG_DIR/ep-$(printf '%02d' "$ep").log"
     : > "$EP_LOG"
 
+    # Orphan-dataset cleanup. If a previous iteration aborted mid-way,
+    # LeRobotDataset.create() may have already built the directory before
+    # the failure; total_episodes stays 0 but the directory exists, which
+    # then trips auto_collect.py's "dataset root already exists" guard
+    # on the next iteration (since we don't pass --resume when
+    # pre_count == 0). Remove the empty shell so the next run can
+    # create the dataset cleanly.
+    #
+    # Only applies after the first iteration, so we never clobber a
+    # pre-existing empty dataset the user intentionally pointed us at.
+    if (( ep > 1 )) && [[ "$pre_count" -eq 0 && -d "$DATASET" ]]; then
+        echo "[wrapper] Removing orphan empty dataset dir: $DATASET"
+        rm -rf "$DATASET"
+    fi
+
     launch_gazebo "$CONFIG"
     if ! wait_for_ready "$READY_TIMEOUT"; then
         echo "[wrapper] Gazebo failed to come up; tail of $GAZEBO_LOG:"

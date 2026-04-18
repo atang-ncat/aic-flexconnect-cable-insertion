@@ -1040,6 +1040,18 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         This avoids the impedance controller snapping to a distant target and
         slamming into obstacles.
 
+        Note on the force-drag during Approach: with straight-line
+        interpolation, the plug typically spends ~3 s being dragged
+        across the card face while it transitions from "behind the card"
+        (axial ≈ -250 mm) to "in front of the port" (axial ≈ -20 mm).
+        That drag produces the Tier-2 scoring penalty. Two-leg
+        "lift-then-translate" paths were tried (world +z and port +z)
+        and both regressed success rate to 0%; see
+        docs/auto_collection_force_notes.md for the diagnostic record.
+        The proper fix is a joint-space home move before Approach to
+        make the starting pose deterministic — not a Cartesian path
+        tweak.
+
         If `require_lateral_m` and/or `require_axial_above_m` are set, the
         phase holds z constant (z_start) and exits *early* when all set
         conditions have held simultaneously for `converge_hold_s` seconds:
@@ -1248,6 +1260,15 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     # that happens there is nothing useful Fine align can do anyway.
     # If the plug never climbs above the card within 15 s we abort
     # and retry from scratch rather than wedge it against the edge.
+    # Straight-line Cartesian interpolation from the current TCP pose
+    # to port+0.22 in port frame. See run_phase() for the lift-waypoint
+    # machinery that's available but not used here: two independent
+    # experiments (world +z lift, port +z lift) both regressed success
+    # rate to 0% — Cartesian path shaping alone cannot avoid the cable
+    # drag that accumulates ~3 s of >20 N force during Approach. See
+    # docs/auto_collection_force_notes.md for the diagnostic data and
+    # a sketch of the proper fix (joint-space "go-home" pose before
+    # Approach, to guarantee a deterministic starting configuration).
     approach_gains = ControllerGains(kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3)
     approach_steps = fps * 15
     if not run_phase("Approach", z_start=0.22, z_end=0.22, gains=approach_gains,
