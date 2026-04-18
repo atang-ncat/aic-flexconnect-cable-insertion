@@ -47,6 +47,15 @@ AUTO_COLLECT="/run/host/scratch2/atang/ws_aic/scripts/auto_collect.py"
 # from the workspace root fails with "could not find pixi.toml".
 PIXI_DIR="/run/host/scratch2/atang/ws_aic/src/aic"
 
+# Tier 2 scoring thresholds (match auto_collect.py + force_monitor.py).
+# An episode would incur the -12 pt penalty if tared force stays above
+# FORCE_THRESHOLD_N for more than FORCE_PENALTY_DWELL_S seconds cumulative.
+FORCE_THRESHOLD_N=20.0
+FORCE_PENALTY_DWELL_S=1.0
+
+# Where per-episode auto_collect logs get captured (for force stat extraction).
+EP_LOG_DIR="/tmp/collect_many_logs"
+
 usage() {
     cat <<'EOF'
 Usage: collect_many.sh [options]
@@ -197,11 +206,24 @@ saved_this_run=0
 failed_launches=0
 failed_collections=0
 
+# Per-episode force diagnostic tables. Index is the episode number (1-based);
+# entries are added only for attempts that actually produced a saved episode.
+# STATUS is one of SAVED | NO_SAVE | LAUNCH_FAIL. MAX and DWELL are strings so
+# we can store "?" when we couldn't parse them.
+declare -a EP_STATUS
+declare -a EP_MAX_FORCE
+declare -a EP_DWELL
+declare -a EP_WOULD_PENALIZE   # "yes" | "no" | "?"
+
+mkdir -p "$EP_LOG_DIR"
+
 echo "[wrapper] === collect_many.sh ==="
-echo "[wrapper] target:      $EPISODES episode(s)"
-echo "[wrapper] config:      $CONFIG"
-echo "[wrapper] port frame:  $PORT_FRAME"
-echo "[wrapper] dataset:     $DATASET"
+echo "[wrapper] target:        $EPISODES episode(s)"
+echo "[wrapper] config:        $CONFIG"
+echo "[wrapper] port frame:    $PORT_FRAME"
+echo "[wrapper] dataset:       $DATASET"
+echo "[wrapper] scoring gate:  > ${FORCE_THRESHOLD_N} N for > ${FORCE_PENALTY_DWELL_S} s => -12 pts"
+echo "[wrapper] ep logs:       $EP_LOG_DIR/ep-NN.log"
 echo "[wrapper] starting with $initial_saved existing episode(s) in dataset"
 echo ""
 
@@ -211,6 +233,8 @@ for ((ep=1; ep<=EPISODES; ep++)); do
     echo "=================================================================="
 
     pre_count=$(count_saved_episodes)
+    EP_LOG="$EP_LOG_DIR/ep-$(printf '%02d' "$ep").log"
+    : > "$EP_LOG"
 
     launch_gazebo "$CONFIG"
     if ! wait_for_ready "$READY_TIMEOUT"; then
@@ -218,6 +242,10 @@ for ((ep=1; ep<=EPISODES; ep++)); do
         tail -n 20 "$GAZEBO_LOG" | sed 's/^/[gazebo] /'
         cleanup_gazebo
         failed_launches=$((failed_launches + 1))
+        EP_STATUS[$ep]="LAUNCH_FAIL"
+        EP_MAX_FORCE[$ep]="-"
+        EP_DWELL[$ep]="-"
+        EP_WOULD_PENALIZE[$ep]="-"
         continue
     fi
 
@@ -234,7 +262,8 @@ for ((ep=1; ep<=EPISODES; ep++)); do
     echo "[wrapper] Running auto_collect.py (resume='$resume_flag')"
     # `pixi run` requires the working directory to contain pixi.toml, so
     # cd into the pixi project in a subshell. The subshell isolates the
-    # cd so $PWD is unchanged afterwards.
+    # cd so $PWD is unchanged afterwards. stdout+stderr is teed to
+    # $EP_LOG so we can parse force stats after the run.
     # shellcheck disable=SC2086
     (
         cd "$PIXI_DIR" && \
@@ -244,24 +273,66 @@ for ((ep=1; ep<=EPISODES; ep++)); do
             --port-frame "$PORT_FRAME" \
             $extra_plug \
             --num-episodes 1 --max-attempts "$MAX_ATTEMPTS" \
-            --exit-on-success $resume_flag
-    )
-    rc=$?
+            --exit-on-success $resume_flag 2>&1
+    ) | tee "$EP_LOG"
+    rc=${PIPESTATUS[0]}
 
     post_count=$(count_saved_episodes)
     cleanup_gazebo
 
     if (( post_count > pre_count )); then
         saved_this_run=$((saved_this_run + 1))
+
+        # Extract force stats from auto_collect's save line. Format:
+        #   "  SUCCESS! Saving N frames (max_force=X.XN, force_above_threshold=Y.YYs, ...)"
+        stats_line=$(grep -E 'SUCCESS! Saving .*max_force=' "$EP_LOG" | tail -n 1 || true)
+        if [[ -n "$stats_line" ]]; then
+            mf=$(echo "$stats_line" | sed -nE 's/.*max_force=([0-9.]+)N.*/\1/p')
+            dw=$(echo "$stats_line" | sed -nE 's/.*force_above_threshold=([0-9.]+)s.*/\1/p')
+        else
+            mf="?"
+            dw="?"
+        fi
+        [[ -z "$mf" ]] && mf="?"
+        [[ -z "$dw" ]] && dw="?"
+
+        if [[ "$dw" == "?" ]]; then
+            would="?"
+        elif awk -v d="$dw" -v t="$FORCE_PENALTY_DWELL_S" \
+                'BEGIN{ exit (d+0 > t+0) ? 0 : 1 }'; then
+            would="yes"
+        else
+            would="no"
+        fi
+
+        EP_STATUS[$ep]="SAVED"
+        EP_MAX_FORCE[$ep]="$mf"
+        EP_DWELL[$ep]="$dw"
+        EP_WOULD_PENALIZE[$ep]="$would"
+
         echo "[wrapper] Episode $ep: SAVED (dataset now has $post_count total)"
+        echo "[wrapper]              max_force=${mf} N, time>${FORCE_THRESHOLD_N%.*}N=${dw} s, penalize=${would}"
     else
         failed_collections=$((failed_collections + 1))
+        EP_STATUS[$ep]="NO_SAVE"
+        EP_MAX_FORCE[$ep]="-"
+        EP_DWELL[$ep]="-"
+        EP_WOULD_PENALIZE[$ep]="-"
         echo "[wrapper] Episode $ep: NO SAVE (rc=$rc, dataset still at $post_count)"
     fi
 done
 
 elapsed=$((SECONDS - started_at))
 final_count=$(count_saved_episodes)
+
+would_pass=0
+would_fail=0
+for ((i=1; i<=EPISODES; i++)); do
+    case "${EP_WOULD_PENALIZE[$i]:-}" in
+        yes) would_fail=$((would_fail + 1)) ;;
+        no)  would_pass=$((would_pass + 1)) ;;
+    esac
+done
 
 echo ""
 echo "=================================================================="
@@ -272,6 +343,22 @@ echo "[wrapper]   dataset episodes:   $initial_saved -> $final_count"
 echo "[wrapper]   launch failures:    $failed_launches"
 echo "[wrapper]   collection failures:$failed_collections"
 printf "[wrapper]   elapsed wall time:  %dm %02ds\n" $((elapsed/60)) $((elapsed%60))
+echo "------------------------------------------------------------------"
+echo "[wrapper]   Tier 2 force gate:  > ${FORCE_THRESHOLD_N} N for > ${FORCE_PENALTY_DWELL_S} s cumulative => -12 pts"
+echo "[wrapper]   would pass scoring: $would_pass"
+echo "[wrapper]   would be penalized: $would_fail"
+echo "------------------------------------------------------------------"
+printf "[wrapper]   %-3s  %-11s  %-10s  %-12s  %s\n" \
+    "EP" "STATUS" "MAX_FORCE" "TIME>THRESH" "PENALIZE"
+for ((i=1; i<=EPISODES; i++)); do
+    st="${EP_STATUS[$i]:-SKIPPED}"
+    mf="${EP_MAX_FORCE[$i]:--}"
+    dw="${EP_DWELL[$i]:--}"
+    pn="${EP_WOULD_PENALIZE[$i]:--}"
+    [[ "$mf" != "-" && "$mf" != "?" ]] && mf="${mf} N"
+    [[ "$dw" != "-" && "$dw" != "?" ]] && dw="${dw} s"
+    printf "[wrapper]   %-3d  %-11s  %-10s  %-12s  %s\n" "$i" "$st" "$mf" "$dw" "$pn"
+done
 echo "=================================================================="
 
 # Non-zero exit if we didn't get everything we asked for
