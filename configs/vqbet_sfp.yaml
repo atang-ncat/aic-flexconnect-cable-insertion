@@ -106,8 +106,19 @@ policy:
   n_action_pred_token: 3
 
   # VQ-VAE pretraining
-  n_vqvae_training_steps: 20_000     # before BeT head starts training
-  vqvae_n_embed: 16
+  # n_vqvae_training_steps: the VQ-BeT paper uses 20k because they train on
+  # diverse multi-task data; our dataset is a single SFP-insertion task whose
+  # 6-D twist action space is small and smooth. Empirically the VQ-VAE loss
+  # has fully converged by step ~1000 (0.072 -> 0.026 in the first 1k steps,
+  # then flat for 5k more). Using 3000 gives headroom and still saves ~4 h
+  # per run versus the default.
+  n_vqvae_training_steps: 3_000
+  # vqvae_n_embed: with n_embed=16 our val codebook usage was ~3.8 unique
+  # codes and ~2.7 unique (level1, level2) combinations out of 16*16=256
+  # possible. That is severe codebook collapse, expected for a narrow action
+  # space. Dropping to 8 reduces wasted codebook slots and typically gives
+  # slightly better utilization without over-constraining expressiveness.
+  vqvae_n_embed: 8
   vqvae_embedding_dim: 256
   vqvae_enc_hidden_dim: 128
 

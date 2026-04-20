@@ -24,6 +24,7 @@ Thumbs.db
 # Teleop datasets (recorded demos — too large for git)
 teleop-dataset/
 teleop-automated-dataset/
+devi-videos/
 
 # Training artifacts (checkpoints, wandb offline logs, smoke-test dirs)
 outputs/
