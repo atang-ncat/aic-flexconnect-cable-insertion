@@ -40,14 +40,23 @@ dataset:
 # ---------------------------------------------------------------------------
 training:
   steps: 200_000                     # total optimizer steps (includes VQ-VAE phase)
-  # batch_size=256 is deliberately higher than the VQ-BeT paper's default of 64
-  # because we are pyav-decode bottlenecked: each dataloader sample costs ~15 ms
-  # of GPU compute but ~10+ ms of video decode, and that cost scales per-sample,
-  # not per-batch. A bigger batch means more samples amortized per optimizer
-  # step and better use of the 49 GB/GPU we have sitting idle. Keep an eye on
-  # the val loss in case larger effective learning steps hurt convergence; if
-  # it does, halve the batch or halve the lr.
-  batch_size: 256
+  # batch_size: 64 matches the VQ-BeT paper.
+  #
+  # We originally set this to 256 because phase 1 (VQ-VAE pretraining) only
+  # runs a tiny MLP, so GPU memory was ~3 GB and we were massively data-bound.
+  # However, phase 2 (BeT head) rearranges images as
+  #   "b s n ... -> (b s n) ..."   (see modeling_vqbet.py:349)
+  # so the effective backbone batch is  batch_size * n_obs_steps * n_cameras.
+  # With batch=256, that's 256*5*1=1280 images through ResNet-50 at 224x224,
+  # which costs ~40 GB of activations alone -- OOM on a 48 GB GPU. The
+  # transition from phase 1 to phase 2 *crashed both v2 runs at step 3000
+  # exactly* for this reason.
+  #
+  # batch=64 gives 320 images through the backbone (~10 GB activations) with
+  # plenty of headroom for gradients, optimizer state, and the GPT head. If
+  # you want to push higher, 128 (640 backbone images, ~20 GB) is the next
+  # safe step; validate with a phase-2 smoke test first.
+  batch_size: 64
   # num_workers: 16 was chosen because we have plenty of CPU cores and the
   # dataloader was the bottleneck at num_workers=8 (pyav decode). More workers
   # == more parallel video decodes == main thread rarely blocks. prefetch_factor
@@ -69,7 +78,10 @@ evaluation:
 
 logging:
   log_freq: 100                      # stdout + wandb scalar log cadence
-  save_freq: 10_000                  # checkpoint cadence (also saves at end)
+  # save_freq: 5000 -- short enough that if phase 2 crashes we lose at most
+  # ~1.5 h of compute. Bumped down from 10k after the v2 phase-1->phase-2
+  # OOM crash taught us to checkpoint earlier into phase 2.
+  save_freq: 5_000                   # checkpoint cadence (also saves at end)
   keep_last_n_checkpoints: 3         # plus always keep best-val
 
 wandb:
