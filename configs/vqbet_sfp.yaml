@@ -1,0 +1,154 @@
+# VQ-BeT training config for the SFP-insertion teleop dataset.
+#
+# Dataset:     151 episodes, 119,144 frames @ 30 Hz (ur5e_aic)
+#              3 cameras (left / center / right), 256x288 native, av1
+#              observation.state: 26-d (TCP pose + vel + error + 7 joint pos)
+#              action:            6-d Cartesian twist (linear xyz, angular xyz)
+#              task:              "Insert SFP connector into SFP port on NIC card"
+#
+# Notes on key choices:
+#   * pretrained ImageNet ResNet-18  ->  use_group_norm MUST be false
+#     (lerobot errors out if you mix pretrained weights with GroupNorm).
+#   * images stay at native 256x288; the VQ-BeT rgb_encoder crops to 224x224
+#     internally (random crop during training, center crop at eval).
+#   * video_backend = "pyav" because the pixi env ships ffmpeg 8 and torchcodec
+#     only supports ffmpeg 4-7.
+
+run_name: null                # if null, auto-generated as vqbet_sfp_<timestamp>
+seed: 42
+output_dir: outputs/vqbet_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp          # label only; nothing is downloaded
+  video_backend: pyav
+  val_num_episodes: 15               # -> 136 train / 15 val, split with `seed`
+
+  # Which image keys to expose as policy inputs. LeRobot 0.4.3's VQ-BeT config
+  # validator only allows ONE image, even though the underlying model can
+  # handle multiple. Start with just the center camera (workspace-facing, best
+  # view of the SFP port). The other two cameras stay in the dataset on disk
+  # and can be added later by extending this list (and relaxing the validator).
+  cameras: ["observation.images.center_camera"]
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 200_000                     # total optimizer steps (includes VQ-VAE phase)
+  # batch_size=256 is deliberately higher than the VQ-BeT paper's default of 64
+  # because we are pyav-decode bottlenecked: each dataloader sample costs ~15 ms
+  # of GPU compute but ~10+ ms of video decode, and that cost scales per-sample,
+  # not per-batch. A bigger batch means more samples amortized per optimizer
+  # step and better use of the 49 GB/GPU we have sitting idle. Keep an eye on
+  # the val loss in case larger effective learning steps hurt convergence; if
+  # it does, halve the batch or halve the lr.
+  batch_size: 256
+  # num_workers: 16 was chosen because we have plenty of CPU cores and the
+  # dataloader was the bottleneck at num_workers=8 (pyav decode). More workers
+  # == more parallel video decodes == main thread rarely blocks. prefetch_factor
+  # bumped to 4 so each worker buffers 4 batches ahead.
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true                      # bf16 autocast on forward + backward
+  amp_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 5_000                   # every N optimizer steps (0 to disable)
+  eval_batches: 50                   # val batches per eval pass
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100                      # stdout + wandb scalar log cadence
+  save_freq: 10_000                  # checkpoint cadence (also saves at end)
+  keep_last_n_checkpoints: 3         # plus always keep best-val
+
+wandb:
+  enable: true
+  project: vqbet_sfp
+  entity: null
+  tags: ["vqbet", "sfp", "teleop-only"]
+
+# ---------------------------------------------------------------------------
+# Vision backbone initialization strategy (applied after the policy is built
+# but before the optimizer is constructed, so the optimizer picks up the new
+# parameters). Options:
+#   source: imagenet  -> torchvision's ImageNet-1K-V1 weights (ResNet)
+#   source: r3m       -> R3M ResNet-50 weights (robotics / Ego4D pretrained).
+#                        Requires vision_backbone: resnet50 above.
+#   source: null      -> random init (VQ-BeT default)
+# ---------------------------------------------------------------------------
+backbone_init:
+  source: r3m
+  # R3M checkpoint is hosted on HF Hub. Torchvision key names are reached by
+  # stripping the `convnet.` prefix; `fc.*` is missing (we chop avgpool + fc
+  # off anyway inside the VQ-BeT rgb encoder).
+  hf_repo: surajnair/r3m-50
+  hf_filename: pytorch_model.bin
+  strip_prefix: "convnet."
+
+# ---------------------------------------------------------------------------
+# VQ-BeT policy hyperparameters (passed as kwargs to VQBeTConfig)
+# ---------------------------------------------------------------------------
+policy:
+  # Observation / action windows
+  n_obs_steps: 5
+  action_chunk_size: 5
+  n_action_pred_token: 3
+
+  # VQ-VAE pretraining
+  n_vqvae_training_steps: 20_000     # before BeT head starts training
+  vqvae_n_embed: 16
+  vqvae_embedding_dim: 256
+  vqvae_enc_hidden_dim: 128
+
+  # Vision
+  #   vision_backbone: any torchvision.models.<name>. We use resnet50 because
+  #     R3M (see backbone_init below) is a ResNet-50 trained on Ego4D
+  #     manipulation videos, which tends to beat ImageNet on manipulation BC.
+  #   pretrained_backbone_weights: null here because we will load R3M weights
+  #     after the policy is built (see backbone_init.source=r3m). If you want
+  #     plain ImageNet pretraining, set source=imagenet below and this field
+  #     is ignored (we still load through torchvision using weights=DEFAULT).
+  vision_backbone: resnet50
+  pretrained_backbone_weights: null
+  use_group_norm: false                  # must be false with any pretrained weights
+  crop_shape: [224, 224]                 # random-crop from native 256x288
+  crop_is_random: true
+  spatial_softmax_num_keypoints: 32
+
+  # BeT GPT head
+  gpt_block_size: 500
+  gpt_input_dim: 512
+  gpt_output_dim: 512
+  gpt_n_layer: 8
+  gpt_n_head: 8
+  gpt_hidden_dim: 512
+  dropout: 0.1
+  offset_loss_weight: 10_000.0
+  primary_code_loss_weight: 5.0
+  secondary_code_loss_weight: 0.5
+  bet_softmax_temperature: 0.1
+  sequentially_select: false
+
+  # Optimizer / scheduler (used by VQBeTConfig.get_optimizer_preset / .get_scheduler_preset)
+  optimizer_lr: 1.0e-4
+  optimizer_betas: [0.95, 0.999]
+  optimizer_eps: 1.0e-8
+  optimizer_weight_decay: 1.0e-6
+  optimizer_vqvae_lr: 1.0e-3
+  optimizer_vqvae_weight_decay: 1.0e-4
+  scheduler_warmup_steps: 500
+
+  # Not pushing to HF Hub from the training loop
+  push_to_hub: false
+  repo_id: null
