@@ -28,6 +28,8 @@ devi-videos/
 
 # Training artifacts (checkpoints, wandb offline logs, smoke-test dirs)
 outputs/
+# Long-running job stdout/stderr captures and PID files
+logs/
 
 # Rosbags (too large for git)
 *.db3

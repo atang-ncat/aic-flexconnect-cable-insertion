@@ -1,0 +1,135 @@
+# ACT v3 training config for the SFP-insertion teleop dataset.
+#
+# v3 = v2 + action-weighted L1 loss.
+#
+# What changed vs act_sfp.yaml (v2):
+#   * action_weighting.enable = true  (down-weights idle frames -- see the
+#     block comment in that section of act_sfp.yaml for the rationale).
+#   * run_name prefix act_v3_*, wandb tags bumped to "v3" + "weighted-l1".
+#   * Otherwise IDENTICAL to v2 (same 3-cam input, same augmentation,
+#     same ResNet-18 backbone, same WD=5e-4, same 50k steps) so the only
+#     difference between act_v3 and the act_v2 baseline is the loss
+#     weighting -- a clean one-variable ablation.
+#
+# Launch (assuming GPU 0 is free after the v2 matrix finishes):
+#     cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \\
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \\
+#         --config /scratch2/atang/ws_aic/configs/act_sfp_v3.yaml
+
+run_name: null                      # auto act_v3_<timestamp> when null
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset  (unchanged from v2)
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 15
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+# ---------------------------------------------------------------------------
+# Training loop  (unchanged from v2)
+# ---------------------------------------------------------------------------
+training:
+  steps: 50_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Image augmentation  (unchanged from v2)
+# ---------------------------------------------------------------------------
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# ---------------------------------------------------------------------------
+# Action-weighted L1 loss  (v3 *only* change vs v2)
+# ---------------------------------------------------------------------------
+# scale=0.03 was picked from scripts/audit_teleop_data.py output:
+#   action_abs_mean_per_dim peaks at 0.019 (dim 3, angular-x), and typical
+#   motion ||a||2 sits in 0.03-0.06 -- so 0.03 puts weight=1.0 on anything
+#   at or above typical motion.
+# floor=0.1 means a pure-idle frame contributes 10x less than a motion
+#   frame to the L1 term.  Small enough to suppress the "predict zero" bias,
+#   large enough that the model still learns useful stillness behavior.
+action_weighting:
+  enable: true
+  scale: 0.03
+  floor: 0.1
+  ceil: 1.0
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing  (unchanged from v2)
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 1_000
+  eval_batches: 50
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v3", "multi-cam", "aug", "weighted-l1"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters  (unchanged from v2)
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
