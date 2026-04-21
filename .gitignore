@@ -23,6 +23,7 @@ Thumbs.db
 
 # Teleop datasets (recorded demos — too large for git)
 teleop-dataset/
+teleop-dataset-smoothed/
 teleop-automated-dataset/
 devi-videos/
 
