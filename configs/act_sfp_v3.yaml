@@ -25,14 +25,17 @@ device: cuda
 # Dataset  (unchanged from v2)
 # ---------------------------------------------------------------------------
 dataset:
-  root: teleop-dataset
+  # v3 default: smoothed data (Sav-Gol, ~56% jerk reduction vs raw).  Override
+  # with ``--set dataset.root=teleop-dataset`` for a raw-data ablation cell.
+  root: teleop-dataset-smoothed
   repo_id: local/teleop_sfp
   video_backend: pyav
   val_num_episodes: 15
+  # v2 result: center_camera alone matched or beat multicam_aug at every
+  # checkpoint (best val/l1 = 0.1352 vs 0.1381).  Side cameras didn't add
+  # signal on the SFP task, and dropping them 3x'd the dataloader throughput.
   cameras:
-    - observation.images.left_camera
     - observation.images.center_camera
-    - observation.images.right_camera
 
 # ---------------------------------------------------------------------------
 # Training loop  (unchanged from v2)

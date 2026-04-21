@@ -12,6 +12,12 @@ eval) can handle both.  Key differences from ``train_vqbet.py``:
     * Custom in-loop image augmentation (ColorJitter + RandomErasing) applied
       to training batches *before* the policy preprocessor so augmentation
       happens in [0, 1] image space rather than on mean-std-centered tensors.
+    * **GPU-side augmentation**: the batch is moved to ``device`` immediately
+      after ``next(dl_iter)``, so ColorJitter / RandomErasing and the mean-std
+      Normalizer all run on the GPU.  This frees the CPU dataloader workers
+      to do only the thing they're good at (video decode -> uint8 tensor), and
+      removes the CPU-aug contention we observed when running multiple ACT
+      jobs in parallel (load avg 300+ with 4 jobs, ~60 with GPU aug).
     * ``best`` symlink tracks the lowest ``val/l1_loss`` we have observed.
 
 Typical launch (from the workspace root):
@@ -288,9 +294,11 @@ class ImageAugmenter:
             if img.ndim == 5:  # (B, T, C, H, W) — flatten time into batch
                 b, t, c, h, w = img.shape
                 img = img.reshape(b * t, c, h, w)
-            # ColorJitter is expensive; gate it behind an independent Bernoulli
-            # per batch to save CPU.  RandomErasing is cheap so we always call
-            # it and let its own ``p`` sample internally.
+            # ColorJitter is still expensive (per-pixel); gate it behind an
+            # independent Bernoulli per batch.  RandomErasing is cheap (a few
+            # rectangles) so we always call it and let its own ``p`` sample
+            # internally.  Both transforms dispatch to the tensor's device
+            # (GPU or CPU) -- no explicit .to() needed.
             if self._cj_p > 0 and torch.rand(()) < self._cj_p:
                 img = self._cj(img)
             img = self._re(img)
@@ -298,6 +306,25 @@ class ImageAugmenter:
                 img = img.reshape(orig_shape)
             batch[k] = img
         return batch
+
+
+def batch_to_device(
+    batch: dict, device: torch.device, non_blocking: bool = True
+) -> dict:
+    """Move every tensor in a LeRobot batch dict to ``device``.
+
+    Non-tensor entries (e.g. string task keys) are passed through.  ``non_blocking``
+    is a no-op unless the source tensors live in pinned memory -- in our setup
+    they do (``pin_memory=True`` in the dataloader), so this overlaps H->D transfer
+    with the previous step's GPU work.
+    """
+    out = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v):
+            out[k] = v.to(device, non_blocking=non_blocking)
+        else:
+            out[k] = v
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +556,9 @@ def evaluate(
     for i, batch in enumerate(dataloader):
         if i >= max_batches:
             break
+        # Mirror the training loop: move to GPU before preprocessor so the
+        # normalizer runs on device.
+        batch = batch_to_device(batch, device)
         batch = preprocessor(batch)
 
         with autocast_ctx():
@@ -728,6 +758,12 @@ def train(cfg: dict) -> None:
     while step < total_steps:
         t_dl0 = time.perf_counter()
         batch = next(dl_iter)
+        # Move the batch to the training device BEFORE aug / norm so both
+        # ColorJitter and the mean-std Normalizer run on GPU (freeing the CPU
+        # dataloader workers to do only video decode).  The Normalizer auto-
+        # migrates its stats to match input device on first call, so we don't
+        # need to .to(device) it explicitly -- see normalize_processor.py:317.
+        batch = batch_to_device(batch, device)
         # Augment BEFORE the preprocessor so [0,1]-space transforms make sense.
         batch = aug(batch)
         # Action weights are computed from RAW (un-normalized) actions, so
@@ -736,8 +772,6 @@ def train(cfg: dict) -> None:
         # the weights here.
         action_weights = action_weighter.weights_from_raw_batch(batch)
         batch = preprocessor(batch)
-        if action_weights is not None:
-            action_weights = action_weights.to(batch[ACTION].device)
         t_dl = time.perf_counter() - t_dl0
 
         t_step0 = time.perf_counter()
