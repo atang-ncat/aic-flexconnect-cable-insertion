@@ -1,0 +1,136 @@
+# ACT v5 training on Savitzky-Golay smoothed dataset.
+#
+# Identical to act_sfp_v5.yaml except:
+#   * dataset.root = teleop-dataset-smoothed (SavGol w=9, polyorder=3)
+#   * run_name prefix updated
+#   * wandb tags include "smoothed"
+#
+# The smoothed dataset was produced by scripts/smooth_actions.py and lives
+# alongside the raw teleop-dataset/.  Action stats (meta/stats.json) were
+# recomputed after smoothing so normalization layers see correct values.
+#
+# Launch:
+#   cd /scratch2/atang/ws_aic/src/aic && pixi run python \
+#       /scratch2/atang/ws_aic/scripts/train_act.py \
+#       --config /scratch2/atang/ws_aic/configs/act_sfp_v5_smoothed.yaml
+
+run_name: null
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset — pointing at the SMOOTHED dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset-smoothed
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 15
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+  trim_tail_fraction: 0.0
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 40_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Image augmentation (GPU-side)
+# ---------------------------------------------------------------------------
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# ---------------------------------------------------------------------------
+# Action-weighted L1 loss
+# ---------------------------------------------------------------------------
+action_weighting:
+  enable: false
+  scale: 0.03
+  floor: 0.5
+  ceil: 1.0
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+early_stopping:
+  enable: true
+  patience_steps: 5_000
+  min_delta: 0.0005
+  min_steps: 12_000
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 1_000
+  eval_batches: 50
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v5", "smoothed"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
