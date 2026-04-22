@@ -68,13 +68,19 @@ import torchvision.transforms.v2 as T  # noqa: E402
 
 from torch.utils.data import Subset  # noqa: E402
 
-from lerobot.configs.types import FeatureType  # noqa: E402
+from lerobot.configs.types import FeatureType, NormalizationMode  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 from lerobot.datasets.utils import dataset_to_policy_features  # noqa: E402
 from lerobot.policies.act.configuration_act import ACTConfig  # noqa: E402
 from lerobot.policies.factory import make_policy, make_pre_post_processors  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_IMAGES  # noqa: E402
 from lerobot.utils.random_utils import set_seed  # noqa: E402
+
+# Local import; sibling file in this same scripts/ directory.
+import sys  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from modeling_discrete_act import DiscreteACTPolicy  # noqa: E402
 
 log = logging.getLogger("train_act")
 
@@ -149,13 +155,25 @@ def build_delta_timestamps(fps: int, policy_cfg: ACTConfig) -> dict[str, list[fl
     return {"action": act_ts}
 
 
-def select_policy_features(ds_meta, camera_keys: list[str]) -> tuple[dict, dict]:
+def select_policy_features(
+    ds_meta,
+    camera_keys: list[str],
+    state_keep_idx: list[int] | None = None,
+) -> tuple[dict, dict]:
     """Filter dataset features to the cameras requested by ``camera_keys``.
 
     ACT happily accepts multi-image inputs, but we still explicitly trim to
     the cameras listed in the config so that later cam-ablation runs don't
     re-introduce dropped views via ``make_policy``'s auto-inference.
+
+    If ``state_keep_idx`` is provided, the ``observation.state`` feature's
+    shape is rewritten to ``(len(state_keep_idx),)`` so the policy builds a
+    state projection sized for the filtered state.  The actual channel
+    selection on each batch happens via ``_apply_state_filter_to_batch`` in
+    the train/eval loops.
     """
+    from dataclasses import replace
+
     all_features = dataset_to_policy_features(ds_meta.features)
     output_features = {k: v for k, v in all_features.items() if v.type is FeatureType.ACTION}
     input_features: dict = {}
@@ -164,11 +182,147 @@ def select_policy_features(ds_meta, camera_keys: list[str]) -> tuple[dict, dict]
             continue
         if v.type is FeatureType.VISUAL and k not in camera_keys:
             continue
+        # Rewrite observation.state shape if the leak-strip filter is on.
+        if k == "observation.state" and state_keep_idx is not None:
+            new_shape = (len(state_keep_idx),)
+            v = replace(v, shape=new_shape)
         input_features[k] = v
     missing = [c for c in camera_keys if c not in input_features]
     if missing:
         raise ValueError(f"Requested cameras not found in dataset: {missing}")
     return input_features, output_features
+
+
+def compute_state_keep_indices(
+    ds_meta,
+    drop_prefixes: list[str] | None,
+    keep_names: list[str] | None = None,
+) -> list[int] | None:
+    """Return the indices of ``observation.state`` columns to keep.
+
+    Priority: if ``keep_names`` is given, keep exactly those (error on miss).
+    Otherwise, if ``drop_prefixes`` is non-empty, drop any column whose name
+    starts with one of those prefixes.  Returns ``None`` to indicate "no
+    filtering" (keep all channels), so upstream code can short-circuit.
+
+    The raw teleop dataset declares 26 state columns; we strip
+    ``tcp_velocity.*`` (cols 7-12) and ``tcp_error.*`` (cols 13-18) because
+    they are near-copies of the action target (validated with corr >=0.97
+    for ``tcp_velocity.angular.x`` vs ``action.angular.x``).  Leaving them
+    in means the policy can achieve val/l1 matching a 157-param OLS from
+    state alone -- i.e. it never needs to learn vision at all.
+    """
+    state_feat = ds_meta.features.get("observation.state")
+    if state_feat is None:
+        return None
+    names = state_feat.get("names")
+    if not names:
+        if drop_prefixes or keep_names:
+            raise ValueError(
+                "dataset lacks observation.state 'names' metadata but a "
+                "state filter was requested; cannot resolve indices."
+            )
+        return None
+
+    if keep_names is not None:
+        idx: list[int] = []
+        missing: list[str] = []
+        for want in keep_names:
+            if want in names:
+                idx.append(names.index(want))
+            else:
+                missing.append(want)
+        if missing:
+            raise ValueError(f"state_keep_names not found in dataset: {missing}")
+        return idx
+
+    drop_prefixes = drop_prefixes or []
+    if not drop_prefixes:
+        return None
+    idx = [i for i, n in enumerate(names) if not any(n.startswith(p) for p in drop_prefixes)]
+    if len(idx) == len(names):
+        return None  # nothing actually dropped
+    return idx
+
+
+def filter_state_stats(stats: dict, keep_idx: list[int]) -> dict:
+    """Return a new stats dict with ``observation.state`` channels sliced.
+
+    Stats dicts arrive with ``min/max/mean/std/count/q01/q10/q50/q90/q99``
+    per feature.  We slice every per-channel array, leave scalars alone.
+    """
+    if "observation.state" not in stats:
+        return stats
+    out = {k: v for k, v in stats.items()}
+    src = stats["observation.state"]
+    new: dict = {}
+    idx_np = np.asarray(keep_idx, dtype=np.int64)
+    for sk, sv in src.items():
+        arr = np.asarray(sv)
+        if arr.ndim >= 1 and arr.shape[0] == len(src["mean"]):
+            new[sk] = arr[idx_np]
+        else:
+            new[sk] = arr
+    out["observation.state"] = new
+    return out
+
+
+def apply_state_filter_to_batch(
+    batch: dict, keep_idx: torch.Tensor | None
+) -> dict:
+    """Slice ``observation.state`` on the LAST axis to the kept indices.
+
+    Handles both ``(B, D)`` and ``(B, T, D)`` shapes.  No-op when
+    ``keep_idx`` is None.  Returns the same batch dict (mutated) for
+    convenience.
+    """
+    if keep_idx is None:
+        return batch
+    key = "observation.state"
+    if key not in batch:
+        return batch
+    s = batch[key]
+    # keep_idx lives on the same device as s for efficient index_select.
+    if keep_idx.device != s.device:
+        keep_idx = keep_idx.to(s.device)
+    batch[key] = s.index_select(dim=-1, index=keep_idx)
+    return batch
+
+
+def compute_train_only_stats(
+    train_ds: LeRobotDataset,
+    baseline_stats: dict,
+    feature_keys: Iterable[str] = ("observation.state", "action"),
+) -> dict:
+    """Recompute stats for ``feature_keys`` over the TRAIN episodes only.
+
+    Why: ``train_ds.meta.stats`` is loaded from ``meta/stats.json`` which
+    was computed at dataset-build time over ALL 151 episodes, including
+    the 15 we hold out for val.  The normalizer ends up using val-set
+    moments, a real if mild leak.
+
+    We only recompute per-frame continuous features (state, action); video
+    stats stay on baseline_stats unchanged because recomputing them would
+    cost hours of video decode, and image normalization in ACT is
+    ImageNet-constant anyway (see ACTConfig.normalization_mapping).
+    """
+    out = {k: v for k, v in baseline_stats.items()}
+    for key in feature_keys:
+        if key not in baseline_stats:
+            continue
+        col = train_ds.hf_dataset[key]
+        arr = np.stack([np.asarray(x, dtype=np.float64) for x in col])
+        new: dict = {
+            "min": arr.min(axis=0),
+            "max": arr.max(axis=0),
+            "mean": arr.mean(axis=0),
+            "std": arr.std(axis=0).clip(min=1e-8),
+            "count": np.asarray([len(arr)], dtype=np.int64),
+        }
+        for q, qv in ((0.01, "q01"), (0.10, "q10"), (0.50, "q50"), (0.90, "q90"), (0.99, "q99")):
+            new[qv] = np.quantile(arr, q, axis=0)
+        out[key] = new
+    return out
 
 
 def _restrict_video_keys(meta, keep: list[str]) -> None:
@@ -234,7 +388,14 @@ def trim_episode_tails(
     return Subset(ds, kept)
 
 
-def make_datasets(cfg: dict, policy_cfg: ACTConfig) -> tuple[LeRobotDataset, LeRobotDataset]:
+def make_datasets(
+    cfg: dict, policy_cfg: ACTConfig
+) -> tuple[LeRobotDataset, LeRobotDataset, list[int] | None]:
+    """Build train/val datasets and return them along with the state-keep
+    indices (or ``None`` if no state filter).  The caller threads
+    ``state_keep_idx`` through the train/eval loops to slice each batch's
+    ``observation.state`` before the preprocessor sees it.
+    """
     ds_cfg = cfg["dataset"]
     probe = LeRobotDataset(
         repo_id=ds_cfg["repo_id"],
@@ -243,7 +404,22 @@ def make_datasets(cfg: dict, policy_cfg: ACTConfig) -> tuple[LeRobotDataset, LeR
     )
     fps = probe.fps
     n_episodes = probe.num_episodes
-    input_features, output_features = select_policy_features(probe.meta, ds_cfg["cameras"])
+    state_keep_idx = compute_state_keep_indices(
+        probe.meta,
+        drop_prefixes=ds_cfg.get("state_drop_prefixes"),
+        keep_names=ds_cfg.get("state_keep_names"),
+    )
+    if state_keep_idx is not None:
+        names = probe.meta.features["observation.state"].get("names") or []
+        kept = [names[i] for i in state_keep_idx]
+        dropped = [n for n in names if n not in set(kept)]
+        log.info(
+            "State filter: keeping %d/%d columns -- kept=%s dropped=%s",
+            len(kept), len(names), kept, dropped,
+        )
+    input_features, output_features = select_policy_features(
+        probe.meta, ds_cfg["cameras"], state_keep_idx=state_keep_idx,
+    )
     policy_cfg.input_features = input_features
     policy_cfg.output_features = output_features
     del probe
@@ -281,7 +457,7 @@ def make_datasets(cfg: dict, policy_cfg: ACTConfig) -> tuple[LeRobotDataset, LeR
             unused, ds_cfg["cameras"],
         )
 
-    return train_ds, val_ds
+    return train_ds, val_ds, state_keep_idx
 
 
 def cycle(iterable: Iterable):
@@ -457,12 +633,15 @@ def weighted_act_forward(
 
     loss_dict: dict[str, float] = {}
     if weights is None:
-        # Same as upstream: mean over (B*T) valid entries.
-        # (Upstream actually uses a simple ``.mean()`` over the masked
-        # tensor, which divides by B*T*A regardless of pad; we retain that
-        # behavior when weighting is off so that loss scales stay identical
-        # to stock runs.)
-        l1_loss = (err * pad_mask).mean()
+        # v5 fix: divide by valid-element count, not B*T*A.  Upstream's
+        # ``(err * pad_mask).mean()`` divides by the total tensor size and
+        # silently shrinks the loss for pad-heavy chunks (end-of-episode
+        # samples with ``chunk_size=100`` pad ~12% of positions).  That
+        # mis-scales the GRADIENT on those chunks and makes
+        # weighted/unweighted comparisons cross-cell dishonest.  The logged
+        # ``train/l1_loss`` diagnostic at line ~476 already uses this
+        # valid-count denominator; now the optimizer does too.
+        l1_loss = (err * pad_mask).sum() / pad_mask.sum().clamp_min(1.0) / err.shape[-1]
     else:
         # weights: (B, T), pad mask collapsed to (B, T)
         mask = pad_mask.squeeze(-1)
@@ -547,6 +726,12 @@ class CheckpointBookkeeper:
                 shutil.rmtree(old, ignore_errors=True)
 
         if is_best and val_loss is not None:
+            # When we promote a new best, the previous best_dir stops being
+            # special.  If it's outside the keep_last_n window, delete it now
+            # so we don't leak one ckpt dir per "new-best" event over a long
+            # run (seen in v4: aggressive save-on-best without this cleanup
+            # would bloat ~200MB per event).
+            prev_best = self.best_dir
             self.best_val = val_loss
             self.best_dir = ckpt_dir
             best_link = self.root / "checkpoints" / "best"
@@ -555,6 +740,13 @@ class CheckpointBookkeeper:
                 best_link.symlink_to(tag, target_is_directory=True)
             except OSError:
                 pass
+            if (
+                prev_best is not None
+                and prev_best != ckpt_dir
+                and prev_best not in self.recent
+                and prev_best.exists()
+            ):
+                shutil.rmtree(prev_best, ignore_errors=True)
 
         return ckpt_dir
 
@@ -619,11 +811,16 @@ def evaluate(
     preprocessor,
     postprocessor,
     dataloader: DataLoader,
-    max_batches: int,
+    max_batches: int | None,
     device: torch.device,
     autocast_ctx,
+    state_keep_t: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    """Compute val/l1_loss + val/action_mse_norm on ``max_batches`` batches.
+    """Compute val/l1_loss + val/action_mse_norm on (up to) ``max_batches`` batches.
+
+    Pass ``max_batches=None`` (or ``<=0``) to iterate the FULL val loader.
+    v5 default is full-val so that run-to-run comparisons aren't biased by
+    whichever 1600 samples happen to sort first.
 
     We deliberately do NOT call ``policy.forward`` here because ACT's forward
     pass requires the VAE encoder's latent outputs to compute the KLD term,
@@ -646,12 +843,14 @@ def evaluate(
     totals: dict[str, float] = {}
     counts: dict[str, int] = {}
 
+    use_full = max_batches is None or max_batches <= 0
     for i, batch in enumerate(dataloader):
-        if i >= max_batches:
+        if not use_full and i >= max_batches:
             break
         # Mirror the training loop: move to GPU before preprocessor so the
         # normalizer runs on device.
         batch = batch_to_device(batch, device)
+        batch = apply_state_filter_to_batch(batch, state_keep_t)
         batch = preprocessor(batch)
 
         with autocast_ctx():
@@ -666,6 +865,8 @@ def evaluate(
             l1 = ((pred - target).abs() * mask).sum() / denom
             mse = ((pred - target).pow(2) * mask).sum() / denom
         else:
+            mask = torch.ones_like(pred[..., :1])
+            denom = torch.tensor(float(pred.numel()), device=pred.device)
             l1 = (pred - target).abs().mean()
             mse = (pred - target).pow(2).mean()
 
@@ -675,6 +876,27 @@ def evaluate(
             totals.get("val/action_mse_norm", 0.0) + float(mse.item())
         )
         counts["val/action_mse_norm"] = counts.get("val/action_mse_norm", 0) + 1
+
+        # If the policy is a classification head, log accuracy too.  We key on
+        # a duck-typed attribute rather than isinstance(DiscreteACTPolicy) so
+        # this works if the policy is wrapped/compiled.
+        if hasattr(policy, "n_classes"):
+            from modeling_discrete_act import snap_to_class
+
+            target_cls = snap_to_class(target)
+            pred_cls = snap_to_class(pred)
+            correct = (target_cls == pred_cls).float()
+            acc = (correct * mask).sum() / denom
+            idle_mask = (target_cls == 1).float() * mask
+            motion_mask = (target_cls != 1).float() * mask
+            motion_denom = motion_mask.sum().clamp_min(1.0)
+            motion_acc = (correct * motion_mask).sum() / motion_denom
+            totals["val/accuracy"] = totals.get("val/accuracy", 0.0) + float(acc.item())
+            counts["val/accuracy"] = counts.get("val/accuracy", 0) + 1
+            totals["val/motion_accuracy"] = (
+                totals.get("val/motion_accuracy", 0.0) + float(motion_acc.item())
+            )
+            counts["val/motion_accuracy"] = counts.get("val/motion_accuracy", 0) + 1
 
     # predict_action_chunk doesn't mutate the internal action queue (it rebuilds
     # it), but select_action's queue may have leftover entries.  Reset to be safe
@@ -690,6 +912,18 @@ def evaluate(
 
 
 def build_act_config(policy_overrides: dict, device: str) -> ACTConfig:
+    # ``discrete_action`` is a custom flag consumed by ``train()``; pop it
+    # before ACTConfig sees kwargs it doesn't understand.
+    policy_overrides = dict(policy_overrides)
+    policy_overrides.pop("discrete_action", None)
+    # Allow the config to specify normalization_mapping as
+    # ``{"VISUAL": "MEAN_STD", ...}`` (string-valued, so YAML-friendly); map
+    # strings to the NormalizationMode enum here.
+    nm = policy_overrides.get("normalization_mapping")
+    if isinstance(nm, dict):
+        policy_overrides["normalization_mapping"] = {
+            k: (NormalizationMode[v] if isinstance(v, str) else v) for k, v in nm.items()
+        }
     cfg = ACTConfig(**policy_overrides)
     cfg.device = device
     return cfg
@@ -752,21 +986,62 @@ def train(cfg: dict) -> None:
     policy_cfg = build_act_config(cfg["policy"], device=cfg["device"])
 
     # --- Datasets ---
-    train_ds, val_ds = make_datasets(cfg, policy_cfg)
+    train_ds, val_ds, state_keep_idx = make_datasets(cfg, policy_cfg)
     log.info(
         "Train: %d ep / %d frames | Val: %d ep / %d frames",
         train_ds.num_episodes, train_ds.num_frames, val_ds.num_episodes, val_ds.num_frames,
     )
 
+    # Materialize state_keep_idx as a tensor once; moved to device lazily per-batch.
+    state_keep_t: torch.Tensor | None = (
+        torch.as_tensor(state_keep_idx, dtype=torch.long)
+        if state_keep_idx is not None
+        else None
+    )
+
     # --- Policy + processors ---
-    policy = make_policy(cfg=policy_cfg, ds_meta=train_ds.meta)
+    #
+    # Classification variant: bypass LeRobot's make_policy so we can
+    # instantiate DiscreteACTPolicy with the config already filled in by
+    # ``make_datasets``.  make_policy does some normalization-mapping
+    # validation we still want, so we only branch when the flag is on.
+    discrete_cfg = (cfg.get("policy") or {}).get("discrete_action") or {}
+    use_discrete = bool(discrete_cfg.get("enable", False))
+    if use_discrete:
+        if policy_cfg.normalization_mapping.get(FeatureType.ACTION) is not NormalizationMode.IDENTITY:
+            log.warning(
+                "discrete_action is ON but normalization_mapping.ACTION=%s; "
+                "forcing IDENTITY so the class-snap receives raw physical values.",
+                policy_cfg.normalization_mapping.get(FeatureType.ACTION),
+            )
+            policy_cfg.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY
+        policy = DiscreteACTPolicy(policy_cfg)
+        log.info(
+            "Using DiscreteACTPolicy: %d dims x %d classes (values={-0.1, 0, +0.1})",
+            policy.action_dim, policy.n_classes,
+        )
+    else:
+        policy = make_policy(cfg=policy_cfg, ds_meta=train_ds.meta)
     policy.to(device)
     policy.train()
+
+    # Stats for the preprocessor:
+    #   1. Baseline = train_ds.meta.stats (from meta/stats.json at build time).
+    #   2. If dataset.stats_train_only, recompute state+action stats from
+    #      train episodes only (closes a mild val-leak in normalization).
+    #   3. If state_keep_idx is set, slice the state stats to the kept cols so
+    #      the normalizer matches the filtered input shape.
+    baseline_stats = train_ds.meta.stats
+    if bool(cfg.get("dataset", {}).get("stats_train_only", False)):
+        baseline_stats = compute_train_only_stats(train_ds, baseline_stats)
+        log.info("Dataset stats recomputed on train episodes only.")
+    if state_keep_idx is not None:
+        baseline_stats = filter_state_stats(baseline_stats, state_keep_idx)
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
         pretrained_path=None,
-        dataset_stats=train_ds.meta.stats,
+        dataset_stats=baseline_stats,
     )
 
     n_total = sum(p.numel() for p in policy.parameters())
@@ -789,7 +1064,14 @@ def train(cfg: dict) -> None:
 
     # --- Action-weighted L1 (v3 intervention; see ActionWeighter docstring) ---
     action_weighter = ActionWeighter(cfg.get("action_weighting"))
-    if action_weighter.enabled:
+    if action_weighter.enabled and use_discrete:
+        log.warning(
+            "action_weighting.enable=True is incompatible with discrete_action "
+            "(weights are defined on an L1 regression objective, not CE).  "
+            "Disabling action weighting for this run."
+        )
+        action_weighter.enabled = False
+    elif action_weighter.enabled:
         log.info(
             "Action-weighted L1 loss ENABLED: scale=%g floor=%g ceil=%g",
             action_weighter.scale, action_weighter.floor, action_weighter.ceil,
@@ -812,13 +1094,18 @@ def train(cfg: dict) -> None:
         prefetch_factor=cfg["training"]["prefetch_factor"] if cfg["training"]["num_workers"] > 0 else None,
         persistent_workers=cfg["training"]["num_workers"] > 0,
     )
+    val_nw = max(2, cfg["training"]["num_workers"] // 2)
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg["evaluation"]["eval_batch_size"],
         shuffle=False,
-        num_workers=max(2, cfg["training"]["num_workers"] // 2),
+        num_workers=val_nw,
         pin_memory=cfg["training"]["pin_memory"] and device.type == "cuda",
         drop_last=False,
+        # v5: keep val workers alive between evals.  Without this we pay
+        # ~15-30s of worker spin-up EVERY eval, which at eval_freq=1000
+        # steps and eval_batches=null (full val) dominates wall-clock.
+        persistent_workers=val_nw > 0,
     )
     dl_iter = cycle(train_loader)
 
@@ -877,6 +1164,10 @@ def train(cfg: dict) -> None:
         # migrates its stats to match input device on first call, so we don't
         # need to .to(device) it explicitly -- see normalize_processor.py:317.
         batch = batch_to_device(batch, device)
+        # v5: strip leaky state channels (tcp_velocity, tcp_error) BEFORE the
+        # preprocessor and action-weighter see the state.  No-op if the
+        # dataset.state_drop_prefixes config key is unset.
+        batch = apply_state_filter_to_batch(batch, state_keep_t)
         # Augment BEFORE the preprocessor so [0,1]-space transforms make sense.
         batch = aug(batch)
         # Action weights are computed from RAW (un-normalized) actions, so
@@ -949,25 +1240,36 @@ def train(cfg: dict) -> None:
         val_metrics: dict[str, float] = {}
         if do_eval:
             t0 = time.perf_counter()
+            # v5: ``eval_batches: null`` (or <=0) runs the full val set.
+            eval_batches_cfg = cfg["evaluation"].get("eval_batches")
             val_metrics = evaluate(
                 policy, preprocessor, postprocessor,
-                val_loader, cfg["evaluation"]["eval_batches"], device, autocast_ctx,
+                val_loader, eval_batches_cfg, device, autocast_ctx,
+                state_keep_t=state_keep_t,
             )
             val_metrics["val/eval_s"] = time.perf_counter() - t0
             log.info("eval @ step %d: %s", step, {k: round(v, 5) for k, v in val_metrics.items()})
             if wandb_run is not None:
                 wandb_run.log({**val_metrics, "step": step}, step=step)
 
-        if do_save:
-            is_best = False
-            val_loss = None
-            # We rank checkpoints by val/l1_loss because it is the actual
-            # training objective (minus the CVAE KLD).  val/loss includes
-            # kl_weight * kld which is an additional regularizer term.
+        # Compute is_best on EVERY eval (not just on save_freq boundaries) so we
+        # never miss a best ckpt that happens at a non-save step.  v4 runs hit
+        # this exact bug: best val/l1 was at step 16000 but save_freq=5000, so
+        # the `best` symlink pointed to step 20000 (a worse ckpt).
+        val_loss = None
+        is_best = False
+        if do_eval:
             primary_metric = val_metrics.get("val/l1_loss", val_metrics.get("val/loss"))
             if primary_metric is not None:
                 val_loss = float(primary_metric)
                 is_best = val_loss < ckpt.best_val
+
+        # Save whenever:
+        #   a) we're on a save_freq boundary (periodic last-N retention), OR
+        #   b) this eval is a new best (so `best` is always the real best).
+        # The bookkeeper dedupes step_X directories, so saving on the same step
+        # twice in a row is harmless.
+        if do_save or is_best:
             path = ckpt.save(
                 step=step,
                 policy=policy,
@@ -978,7 +1280,12 @@ def train(cfg: dict) -> None:
                 is_best=is_best,
                 val_loss=val_loss,
             )
-            log.info("saved checkpoint: %s%s", path, " (new best)" if is_best else "")
+            log.info(
+                "saved checkpoint: %s%s%s",
+                path,
+                " (new best)" if is_best else "",
+                " (on-best only, not save_freq)" if is_best and not do_save else "",
+            )
 
         # Early stopping is evaluated AFTER do_save so the best-checkpoint
         # symlink is always up-to-date when we exit the loop.  We feed the

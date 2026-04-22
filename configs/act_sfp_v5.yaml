@@ -1,0 +1,159 @@
+# ACT v5 training config — three-cell ablation focused on (1) seed variance,
+# (2) regularization against the overfitting plateau, and (3) the stacked-
+# smoothed ceiling.
+#
+# Why v5 looks different from v4:
+#   A cross-evaluation of every v2/v3/v4 run on a COMMON reference
+#   (the RAW teleop-dataset val split, all errors measured in physical action
+#   units) showed that v4's "wins" on val/l1 were a normalization-scale
+#   artifact -- the smoothed dataset has ~5-10% lower action std, so the same
+#   prediction error looks numerically smaller in the smoothed-normalized
+#   space.  Once the ruler is the same for all runs, the ranking on
+#   ``l1_phys`` is:
+#       1. act_v2_center_only          0.003603  (raw baseline, old winner)
+#       2. v4_mild_weight              0.003649  (1.3% worse)
+#       3. v4_multicam_smooth          0.003688
+#       4. v3_smooth_only              0.003709
+#       5. v4_boundary_trim            0.003778  (trim HURT, -4.9%)
+#       6. v3_weight_only              0.004355  (aggressive weighting -20%)
+#   Gaps 1-4 sit inside what is probably seed-to-seed noise (never measured),
+#   so v5 first MEASURES that noise floor (v5_seed_variance), then tries
+#   interventions that haven't been tested:
+#       * v5_strong_aug   -- harder regularization; the plateau looks like an
+#                            overfitting ceiling, per the Antigravity review.
+#       * v5_smoothed_combo -- stack the mild-weight+trim+multicam ideas on
+#                            the smoothed dataset; this is the "smoothed
+#                            ceiling" probe (smoothed commands are safer on
+#                            hardware even if a hair worse offline).
+#
+# Common config below.  Each cell overrides exactly the knobs called out in
+# its name via --set in scripts/run_act_v5_ablations.sh.
+#
+# Manual single-cell launch:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v5.yaml
+
+run_name: null
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset  (matches the v2 winning recipe by default: raw, center camera)
+# ---------------------------------------------------------------------------
+dataset:
+  # v5 default = RAW dataset (the v2 winner).  The smoothed-combo cell
+  # overrides this to teleop-dataset-smoothed.
+  root: teleop-dataset
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 15
+  cameras:
+    - observation.images.center_camera
+  trim_tail_fraction: 0.0
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 40_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Image augmentation (GPU-side)
+# ---------------------------------------------------------------------------
+# v2-style moderate aug by default.  The strong-aug cell overrides these.
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# ---------------------------------------------------------------------------
+# Action-weighted L1 loss  (default OFF; smoothed_combo overrides to mild)
+# ---------------------------------------------------------------------------
+action_weighting:
+  enable: false
+  scale: 0.03
+  floor: 0.5
+  ceil: 1.0
+
+# ---------------------------------------------------------------------------
+# Early stopping  (ON by default; patience / min_steps tuned against v4)
+# ---------------------------------------------------------------------------
+# v4 observation: every run's val/l1 min happened by step 16000-23000, and
+# the final 5k steps never recovered.  12k warmup + 5k patience = safe.
+early_stopping:
+  enable: true
+  patience_steps: 5_000
+  min_delta: 0.0005
+  min_steps: 12_000
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 1_000
+  eval_batches: 50
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v5"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters  (matches v2 baseline; strong_aug bumps dropout)
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
