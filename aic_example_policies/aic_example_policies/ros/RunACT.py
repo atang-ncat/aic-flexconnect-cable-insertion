@@ -287,9 +287,12 @@ class RunACT(Policy):
             move_robot(motion_update=motion_update)
             send_feedback("in progress...")
 
-            # Maintain control rate (approx 4Hz loop = 0.25s sleep)
+            # Maintain control rate — MUST match the training dataset's FPS
+            # (30 Hz = 0.033s). The original 4 Hz (0.25s) caused each velocity
+            # command to execute 7.5× longer than intended, producing massive
+            # overshoot on every movement.
             elapsed = time.time() - loop_start
-            time.sleep(max(0, 0.25 - elapsed))
+            time.sleep(max(0, 0.033 - elapsed))
 
         self.get_logger().info("RunACT.insert_cable() exiting...")
         return True
