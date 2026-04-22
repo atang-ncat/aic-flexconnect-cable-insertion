@@ -35,7 +35,7 @@ Usage::
     cd /scratch2/atang/ws_aic/src/aic && pixi run python \\
         /scratch2/atang/ws_aic/scripts/baselines_ols.py \\
         --dataset-root /scratch2/atang/ws_aic/teleop-dataset \\
-        --val-num-episodes 15 --seed 42
+        --val-num-episodes 30 --seed 42
 
 Add ``--wandb`` to publish under project ``act_sfp_baselines``.
 """
@@ -127,7 +127,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--dataset-root", required=True, type=Path)
     p.add_argument("--repo-id", default="local/teleop_sfp")
-    p.add_argument("--val-num-episodes", type=int, default=15)
+    # v6 default: 30 val eps, matching configs/act_sfp_v6.yaml.  Pass
+    # --val-num-episodes 15 to reproduce the v5 comparison baselines.
+    p.add_argument("--val-num-episodes", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb", action="store_true", help="Log to project act_sfp_baselines")
     args = p.parse_args()

@@ -758,7 +758,7 @@ class CheckpointBookkeeper:
 
 @dataclass
 class EarlyStopper:
-    """Patience-based early stopping on ``val/l1_loss``.
+    """Patience-based early stopping on a configurable val metric.
 
     v2/v3 runs showed that ACT's val/l1 plateaus well before the 50k-step
     schedule completes (best usually in the 20k-30k range) and then mildly
@@ -766,33 +766,76 @@ class EarlyStopper:
     only yielded regressions, so v4 introduces early stopping -- let each
     run decide its own budget instead of forcing a fixed wall-clock.
 
+    v6 generalizes this stopper to an arbitrary metric + direction.  v5_cls
+    motivated the change: training-time ``val/l1_loss`` plateaued at step
+    1000 (0.00431) but ``val/motion_accuracy`` kept climbing through step
+    10000.  Stopping on l1 threw away 3x of motion-accuracy headroom.
+
     Rules:
       * ``enabled`` off   -> stopper is a no-op (matches legacy v2/v3 behavior).
       * ``enabled`` on    -> once ``step >= min_steps``, stop when we've gone
         ``patience_steps`` consecutive training steps since we last saw an
-        improvement of at least ``min_delta`` (absolute) in val/l1_loss.
-      * The "last improvement step" is updated every time we see a new best,
-        regardless of whether we're past ``min_steps``; that way short-lived
-        improvements right at the end of warmup still count.
+        improvement of at least ``min_delta`` (absolute) in the tracked
+        metric.
+      * Direction is set via ``mode``: ``"minimize"`` (default; e.g., l1,
+        mse, cross-entropy) or ``"maximize"`` (e.g., motion_accuracy,
+        accuracy, task success).
+
+    ``is_improvement`` is exposed separately (without the min_delta gate) so
+    the checkpoint bookkeeper can promote on any strict improvement while
+    the stopper itself waits for a min_delta improvement before resetting
+    patience.
     """
 
     enabled: bool = False
     patience_steps: int = 5_000
     min_delta: float = 0.0005
     min_steps: int = 10_000
-    best: float = float("inf")
+    metric: str = "val/l1_loss"
+    mode: str = "minimize"  # or "maximize"
+    best: float = field(init=False)
     best_step: int = 0
     last_improve_step: int = 0
 
-    def update(self, step: int, val_loss: float | None) -> bool:
-        """Return ``True`` iff training should stop at / after ``step``."""
-        if val_loss is None:
+    def __post_init__(self) -> None:
+        if self.mode not in ("minimize", "maximize"):
+            raise ValueError(f"early_stopping.mode must be minimize|maximize, got {self.mode!r}")
+        self.best = float("inf") if self.mode == "minimize" else float("-inf")
+
+    # ---- comparison helpers --------------------------------------------
+    def _is_strict_improvement(self, val: float) -> bool:
+        return val < self.best if self.mode == "minimize" else val > self.best
+
+    def _is_delta_improvement(self, val: float) -> bool:
+        if self.mode == "minimize":
+            return val + self.min_delta < self.best
+        return val - self.min_delta > self.best
+
+    def is_improvement(self, val: float | None) -> bool:
+        """Strict improvement test used by the checkpoint bookkeeper."""
+        if val is None:
             return False
-        if val_loss + self.min_delta < self.best:
-            self.best = val_loss
+        return self._is_strict_improvement(val)
+
+    # ---- main stopper hook ---------------------------------------------
+    def update(self, step: int, value: float | None) -> bool:
+        """Return ``True`` iff training should stop at / after ``step``.
+
+        Rules as of v6:
+          * Any STRICT improvement updates ``self.best`` + ``best_step``.
+          * Only a MIN_DELTA improvement resets the patience counter.
+        The distinction lets the ``best`` checkpoint follow every tiny gain
+        while the stopper still gives up on a plateau.
+        """
+        if value is None:
+            return False
+        if self._is_strict_improvement(value):
+            self.best = value
             self.best_step = step
+        if self._is_delta_improvement(value) or step == 0:
+            # ``step == 0`` isn't normally reachable, but keeps init sane
+            # if someone drives this stopper from tests.
             self.last_improve_step = step
-            return False
         if not self.enabled:
             return False
         if step < self.min_steps:
@@ -834,14 +877,35 @@ def evaluate(
     positions with ``action_is_pad`` so short trajectories don't skew the
     metric.
 
-    * val/l1_loss         -- same objective ACT trains on (ignoring KLD),
-                             directly comparable to train/l1_loss.
-    * val/action_mse_norm -- MSE in the normalized action space, same metric
-                             we tracked for VQ-BeT, so wandb plots line up.
+    v6 pooling fix
+    --------------
+    Pre-v6 this function averaged per-batch fractions unweighted (``sum(frac)
+    / n_batches``), which is a **mean-of-means** estimator.  For metrics
+    whose denominator varies across batches (in particular
+    ``val/motion_accuracy``: motion frames are sparse, so per-batch fractions
+    have very different denominators), that underestimates the pooled number
+    by up to 2x.  We confirmed this on v5_cls:
+
+        training-time val/motion_accuracy @ step 10000 = 0.2650  (mean-of-means)
+        pooled physical-unit cross-eval  @ step 10000 = 0.5690  (correct)
+
+    v6 accumulates numerator and denominator globally per metric and divides
+    once at the end.
+
+    * val/l1_loss         -- same objective ACT trains on (ignoring KLD).
+    * val/action_mse_norm -- MSE in the normalized action space.
+    * val/accuracy        -- fraction of (dim, pos) slots where the argmax
+                             class matches the target class (discrete head).
+    * val/motion_accuracy -- same, restricted to positions whose target is
+                             non-idle.  THIS is the signal for discrete runs.
     """
     policy.eval()
-    totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
+    # (numerator, denominator) accumulator per metric.
+    acc: dict[str, tuple[float, float]] = {}
+
+    def _add(key: str, num: float, den: float) -> None:
+        n, d = acc.get(key, (0.0, 0.0))
+        acc[key] = (n + num, d + den)
 
     use_full = max_batches is None or max_batches <= 0
     for i, batch in enumerate(dataloader):
@@ -859,51 +923,47 @@ def evaluate(
         pred = pred.float()
         target = batch["action"].float()
 
+        A = pred.shape[-1]
         if "action_is_pad" in batch:
-            mask = (~batch["action_is_pad"]).unsqueeze(-1).float()
-            denom = mask.sum().clamp_min(1.0) * pred.shape[-1]
-            l1 = ((pred - target).abs() * mask).sum() / denom
-            mse = ((pred - target).pow(2) * mask).sum() / denom
+            mask = (~batch["action_is_pad"]).unsqueeze(-1).float()  # (B, T, 1)
+            n_valid = float(mask.sum().item())  # positions (not * A)
         else:
             mask = torch.ones_like(pred[..., :1])
-            denom = torch.tensor(float(pred.numel()), device=pred.device)
-            l1 = (pred - target).abs().mean()
-            mse = (pred - target).pow(2).mean()
+            n_valid = float(pred.numel() / A)
 
-        totals["val/l1_loss"] = totals.get("val/l1_loss", 0.0) + float(l1.item())
-        counts["val/l1_loss"] = counts.get("val/l1_loss", 0) + 1
-        totals["val/action_mse_norm"] = (
-            totals.get("val/action_mse_norm", 0.0) + float(mse.item())
-        )
-        counts["val/action_mse_norm"] = counts.get("val/action_mse_norm", 0) + 1
+        # l1 / mse denominators are n_valid * A (one sample per (pos, dim)).
+        _add("val/l1_loss",
+             float(((pred - target).abs() * mask).sum().item()),
+             n_valid * A)
+        _add("val/action_mse_norm",
+             float(((pred - target).pow(2) * mask).sum().item()),
+             n_valid * A)
 
-        # If the policy is a classification head, log accuracy too.  We key on
-        # a duck-typed attribute rather than isinstance(DiscreteACTPolicy) so
-        # this works if the policy is wrapped/compiled.
+        # Classification-head diagnostics.  We key on ``n_classes`` rather
+        # than isinstance(DiscreteACTPolicy) so this works if the policy is
+        # wrapped/compiled.
         if hasattr(policy, "n_classes"):
             from modeling_discrete_act import snap_to_class
 
             target_cls = snap_to_class(target)
             pred_cls = snap_to_class(pred)
             correct = (target_cls == pred_cls).float()
-            acc = (correct * mask).sum() / denom
-            idle_mask = (target_cls == 1).float() * mask
+            # per-(pos, dim) accuracy over all non-pad positions.
+            _add("val/accuracy",
+                 float((correct * mask).sum().item()),
+                 n_valid * A)
             motion_mask = (target_cls != 1).float() * mask
-            motion_denom = motion_mask.sum().clamp_min(1.0)
-            motion_acc = (correct * motion_mask).sum() / motion_denom
-            totals["val/accuracy"] = totals.get("val/accuracy", 0.0) + float(acc.item())
-            counts["val/accuracy"] = counts.get("val/accuracy", 0) + 1
-            totals["val/motion_accuracy"] = (
-                totals.get("val/motion_accuracy", 0.0) + float(motion_acc.item())
-            )
-            counts["val/motion_accuracy"] = counts.get("val/motion_accuracy", 0) + 1
+            motion_denom = float(motion_mask.sum().item())
+            _add("val/motion_accuracy",
+                 float((correct * motion_mask).sum().item()),
+                 motion_denom)
 
     # predict_action_chunk doesn't mutate the internal action queue (it rebuilds
     # it), but select_action's queue may have leftover entries.  Reset to be safe
     # in case a downstream callback calls select_action later.
     policy.reset()
     policy.train()
-    return {k: totals[k] / max(counts[k], 1) for k in totals}
+    return {k: (num / den if den > 0 else 0.0) for k, (num, den) in acc.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -1131,15 +1191,24 @@ def train(cfg: dict) -> None:
 
     # --- Early stopping (v4 intervention; no-op if disabled) ---
     es_cfg = cfg.get("early_stopping") or {}
+    # v6: metric + mode are configurable.  Default stays backward-compatible
+    # with v2-v5 (minimize val/l1_loss).
     stopper = EarlyStopper(
         enabled=bool(es_cfg.get("enable", False)),
         patience_steps=int(es_cfg.get("patience_steps", 5_000)),
         min_delta=float(es_cfg.get("min_delta", 0.0005)),
         min_steps=int(es_cfg.get("min_steps", 10_000)),
+        metric=str(es_cfg.get("metric", "val/l1_loss")),
+        mode=str(es_cfg.get("mode", "minimize")),
     )
+    # Keep the checkpoint bookkeeper's "best" comparison aligned with the
+    # stopper's metric + direction so ``best`` symlink tracks the metric the
+    # run actually cares about.
+    ckpt.best_val = float("-inf") if stopper.mode == "maximize" else float("inf")
     if stopper.enabled:
         log.info(
-            "Early stopping ENABLED: patience=%d steps, min_delta=%.4f, min_steps=%d",
+            "Early stopping ENABLED: metric=%s (%s), patience=%d steps, min_delta=%.4f, min_steps=%d",
+            stopper.metric, stopper.mode,
             stopper.patience_steps, stopper.min_delta, stopper.min_steps,
         )
 
@@ -1256,13 +1325,20 @@ def train(cfg: dict) -> None:
         # never miss a best ckpt that happens at a non-save step.  v4 runs hit
         # this exact bug: best val/l1 was at step 16000 but save_freq=5000, so
         # the `best` symlink pointed to step 20000 (a worse ckpt).
+        #
+        # v6: pull the primary metric from the stopper config so "best" tracks
+        # the metric the run cares about (e.g. val/motion_accuracy maximized
+        # for classification runs).
         val_loss = None
         is_best = False
         if do_eval:
-            primary_metric = val_metrics.get("val/l1_loss", val_metrics.get("val/loss"))
+            primary_metric = val_metrics.get(
+                stopper.metric,
+                val_metrics.get("val/l1_loss", val_metrics.get("val/loss")),
+            )
             if primary_metric is not None:
                 val_loss = float(primary_metric)
-                is_best = val_loss < ckpt.best_val
+                is_best = stopper.is_improvement(val_loss)
 
         # Save whenever:
         #   a) we're on a save_freq boundary (periodic last-N retention), OR
@@ -1292,12 +1368,17 @@ def train(cfg: dict) -> None:
         # stopper every eval (not every save), because eval_freq is typically
         # finer-grained than save_freq.
         if do_eval:
-            primary = val_metrics.get("val/l1_loss", val_metrics.get("val/loss"))
+            primary = val_metrics.get(
+                stopper.metric,
+                val_metrics.get("val/l1_loss", val_metrics.get("val/loss")),
+            )
             should_stop = stopper.update(step, float(primary) if primary is not None else None)
             if wandb_run is not None and stopper.enabled:
                 wandb_run.log(
                     {
-                        "val/best_l1": stopper.best,
+                        # v6: report under a neutral name so wandb panels don't
+                        # assume l1 -- the stopper's metric is configurable.
+                        "val/best_tracked": stopper.best,
                         "val/steps_since_improvement": step - stopper.last_improve_step,
                         "step": step,
                     },
