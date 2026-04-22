@@ -66,6 +66,8 @@ except ImportError:
 import torch.nn.functional as F  # noqa: E402
 import torchvision.transforms.v2 as T  # noqa: E402
 
+from torch.utils.data import Subset  # noqa: E402
+
 from lerobot.configs.types import FeatureType  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 from lerobot.datasets.utils import dataset_to_policy_features  # noqa: E402
@@ -188,6 +190,48 @@ def _restrict_video_keys(meta, keep: list[str]) -> None:
     _FilteredMeta.__name__ = orig_cls.__name__ + "WithFilteredVideoKeys"
     _FilteredMeta.__qualname__ = orig_cls.__qualname__ + "WithFilteredVideoKeys"
     meta.__class__ = _FilteredMeta
+
+
+def trim_episode_tails(
+    ds: LeRobotDataset, tail_frac: float, min_keep: int = 1
+) -> Subset:
+    """Return a ``Subset`` of ``ds`` that drops the last ``tail_frac`` of frames
+    of each episode.
+
+    Why: the audit (``scripts/audit_teleop_data.py``) showed that ~60% of frames
+    are near-idle, and most of those idle frames cluster at the END of each
+    episode (post-insertion stillness after the operator stopped driving).
+    Training through those frames biases the model toward "predict zero" and
+    inflates the effective training set without adding useful signal.
+
+    We filter at the FRAME-INPUT level, not at the action-target level -- an
+    unfiltered frame whose chunk extends into the trimmed tail still uses the
+    tail's actions as targets (LeRobotDataset handles that via its delta-index
+    padding).  That's intentional: we want the model to still learn "hold
+    still" once insertion is done, just not be dominated by it.
+
+    ``min_keep`` guards against degenerate-short episodes (e.g. teleop aborted
+    early): we keep at least ``min_keep`` frames per episode no matter what.
+    """
+    if tail_frac <= 0.0:
+        return Subset(ds, list(range(len(ds))))
+    ep_idx = np.asarray(ds.hf_dataset["episode_index"])
+    kept: list[int] = []
+    dropped = 0
+    unique_eps = np.unique(ep_idx)
+    for e in unique_eps:
+        frame_positions = np.nonzero(ep_idx == e)[0]
+        n = len(frame_positions)
+        keep_n = max(min_keep, int(round(n * (1.0 - tail_frac))))
+        kept.extend(frame_positions[:keep_n].tolist())
+        dropped += n - keep_n
+    log.info(
+        "Boundary trim: tail_frac=%.2f -> kept %d / %d frames (dropped %d, "
+        "~%.1f%% of %d episodes)",
+        tail_frac, len(kept), len(ds), dropped, 100.0 * dropped / max(len(ds), 1),
+        len(unique_eps),
+    )
+    return Subset(ds, kept)
 
 
 def make_datasets(cfg: dict, policy_cfg: ACTConfig) -> tuple[LeRobotDataset, LeRobotDataset]:
@@ -516,6 +560,55 @@ class CheckpointBookkeeper:
 
 
 # ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EarlyStopper:
+    """Patience-based early stopping on ``val/l1_loss``.
+
+    v2/v3 runs showed that ACT's val/l1 plateaus well before the 50k-step
+    schedule completes (best usually in the 20k-30k range) and then mildly
+    overfits for the rest of training.  Burning compute past that plateau
+    only yielded regressions, so v4 introduces early stopping -- let each
+    run decide its own budget instead of forcing a fixed wall-clock.
+
+    Rules:
+      * ``enabled`` off   -> stopper is a no-op (matches legacy v2/v3 behavior).
+      * ``enabled`` on    -> once ``step >= min_steps``, stop when we've gone
+        ``patience_steps`` consecutive training steps since we last saw an
+        improvement of at least ``min_delta`` (absolute) in val/l1_loss.
+      * The "last improvement step" is updated every time we see a new best,
+        regardless of whether we're past ``min_steps``; that way short-lived
+        improvements right at the end of warmup still count.
+    """
+
+    enabled: bool = False
+    patience_steps: int = 5_000
+    min_delta: float = 0.0005
+    min_steps: int = 10_000
+    best: float = float("inf")
+    best_step: int = 0
+    last_improve_step: int = 0
+
+    def update(self, step: int, val_loss: float | None) -> bool:
+        """Return ``True`` iff training should stop at / after ``step``."""
+        if val_loss is None:
+            return False
+        if val_loss + self.min_delta < self.best:
+            self.best = val_loss
+            self.best_step = step
+            self.last_improve_step = step
+            return False
+        if not self.enabled:
+            return False
+        if step < self.min_steps:
+            return False
+        return (step - self.last_improve_step) >= self.patience_steps
+
+
+# ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
 
@@ -702,9 +795,15 @@ def train(cfg: dict) -> None:
             action_weighter.scale, action_weighter.floor, action_weighter.ceil,
         )
 
+    # --- Boundary-trim (v4 intervention; leaves val set untouched) ---
+    tail_frac = float(cfg.get("dataset", {}).get("trim_tail_fraction", 0.0) or 0.0)
+    train_src: Any = train_ds
+    if tail_frac > 0.0:
+        train_src = trim_episode_tails(train_ds, tail_frac=tail_frac)
+
     # --- Dataloaders ---
     train_loader = DataLoader(
-        train_ds,
+        train_src,
         batch_size=cfg["training"]["batch_size"],
         shuffle=True,
         num_workers=cfg["training"]["num_workers"],
@@ -742,6 +841,20 @@ def train(cfg: dict) -> None:
     eval_freq = int(cfg["evaluation"]["eval_freq"])
     total_steps = int(cfg["training"]["steps"])
     grad_clip = float(cfg["training"]["grad_clip_norm"])
+
+    # --- Early stopping (v4 intervention; no-op if disabled) ---
+    es_cfg = cfg.get("early_stopping") or {}
+    stopper = EarlyStopper(
+        enabled=bool(es_cfg.get("enable", False)),
+        patience_steps=int(es_cfg.get("patience_steps", 5_000)),
+        min_delta=float(es_cfg.get("min_delta", 0.0005)),
+        min_steps=int(es_cfg.get("min_steps", 10_000)),
+    )
+    if stopper.enabled:
+        log.info(
+            "Early stopping ENABLED: patience=%d steps, min_delta=%.4f, min_steps=%d",
+            stopper.patience_steps, stopper.min_delta, stopper.min_steps,
+        )
 
     log.info(
         "Training ACT for %d steps | batch=%d | lr=%g | weight_decay=%g | cams=%d",
@@ -866,6 +979,45 @@ def train(cfg: dict) -> None:
                 val_loss=val_loss,
             )
             log.info("saved checkpoint: %s%s", path, " (new best)" if is_best else "")
+
+        # Early stopping is evaluated AFTER do_save so the best-checkpoint
+        # symlink is always up-to-date when we exit the loop.  We feed the
+        # stopper every eval (not every save), because eval_freq is typically
+        # finer-grained than save_freq.
+        if do_eval:
+            primary = val_metrics.get("val/l1_loss", val_metrics.get("val/loss"))
+            should_stop = stopper.update(step, float(primary) if primary is not None else None)
+            if wandb_run is not None and stopper.enabled:
+                wandb_run.log(
+                    {
+                        "val/best_l1": stopper.best,
+                        "val/steps_since_improvement": step - stopper.last_improve_step,
+                        "step": step,
+                    },
+                    step=step,
+                )
+            if should_stop:
+                log.info(
+                    "Early stop @ step %d: no improvement in %d steps "
+                    "(best=%.5f @ step %d)",
+                    step, step - stopper.last_improve_step,
+                    stopper.best, stopper.best_step,
+                )
+                # Ensure we have a checkpoint saved at the stop point if we
+                # haven't just saved one.  This makes the `last` symlink land
+                # on the final state.
+                if not do_save:
+                    ckpt.save(
+                        step=step,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        is_best=False,
+                        val_loss=float(primary) if primary is not None else None,
+                    )
+                break
 
     elapsed = time.perf_counter() - t_start
     log.info(
