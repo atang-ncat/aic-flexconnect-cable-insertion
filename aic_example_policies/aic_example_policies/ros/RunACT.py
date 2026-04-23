@@ -59,15 +59,8 @@ class RunACT(Policy):
         # -------------------------------------------------------------------------
         # 1. Configuration & Weights Loading
         # -------------------------------------------------------------------------
-        repo_id = "grkw/aic_act_policy"
-
         # Path to your checkpoint folder
-        policy_path = Path(
-            snapshot_download(
-                repo_id=repo_id,
-                allow_patterns=["config.json", "model.safetensors", "*.safetensors"],
-            )
-        )
+        policy_path = Path("/scratch2/atang/ws_aic/outputs/act_sfp/act_sfp_20260422_164944/checkpoints/best")
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
         with open(policy_path / "config.json", "r") as f:
