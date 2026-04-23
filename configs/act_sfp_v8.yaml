@@ -1,0 +1,221 @@
+# ACT v8 — previous-action input + lean CVAE-free classifier.
+#
+# Motivation
+# ----------
+# v6/v6b plateaued at motion_accuracy ≈ 0.52 with a 51.6M-param ACT + 3
+# cameras + 14-D clean state.  On the same 30-episode val split:
+#
+#     zero-predictor                      motion_acc = 0.000   l1_phys = 0.00681
+#     OLS(clean 14-D state)               motion_acc = 0.318   l1_phys = 0.00930
+#     OLS(full 26-D state, leaky)         motion_acc = 0.808   l1_phys = 0.00363
+#     OLS(prev action only, 6-D)          motion_acc = 0.930   l1_phys = 0.00160  ★
+#     OLS(clean state + prev action)      motion_acc = 0.930   l1_phys = 0.00174
+#     v6b best @ step 14000               motion_acc = 0.519   l1_phys = 0.00523
+#
+# A 6-parameter "persistence" model — OLS on action[t-1] predicting
+# action[t] — gets 93% motion accuracy.  That headroom is the shape of
+# teleop data: operators hold each button for many consecutive frames,
+# so action[t-1] is the strongest single predictor of action[t].  ACT
+# with n_obs_steps=1 and no action history cannot see this signal at
+# all; that's why OLS-leaky (0.81) is so much higher than our 14-D
+# state ACT (0.52) — tcp_velocity.* is action[t-1] smuggled through
+# the robot driver.
+#
+# v8 gives ACT the same signal honestly, as input rather than leak:
+# observation.state[t] is augmented with action[t-1] on every frame
+# (zero-filled at episode start).  Target is still action[t:t+chunk],
+# so the policy learns a visuomotor residual on top of "keep doing
+# what you were doing."
+#
+# Changes from v6b
+# ----------------
+# Data:
+#   * dataset.previous_action.enable = true
+#     delta_timestamps["action"] gets a -1 prepended; the training /
+#     eval loops pop that off via ``apply_prev_action_to_batch`` and
+#     append it onto observation.state.  No change to action chunk size.
+#
+# Policy:
+#   * use_vae: false  — the CVAE posterior q(z|s,a) makes no sense for a
+#     3-way softmax objective.  With kl_weight=10, the KL term dominated
+#     early training; at eval time z=0 (prior) so the decoder ran in an
+#     untrained regime.  Turning it off removes that mismatch and
+#     speeds up the forward pass.
+#   * dim_model: 256 (was 512), n_encoder_layers: 2 (was 4),
+#     dim_feedforward: 1024 (was 3200).  v6b had 51.6M params; v8 is
+#     ~15M.  At 130k training frames we had ~400 params per frame in
+#     v6b -- unambiguously over-parameterized; val/l1_loss started
+#     drifting up around step 6-10k in every run.
+#
+# Eval cost:
+#   * eval_freq: 2_000 (was 1_000).  Each full-val eval is ~5 min and
+#     training is ~1 min/1k steps.  Halving the eval rate cuts eval's
+#     share of wall-clock from ~75% to ~50%.
+#
+# Diagnostics:
+#   * Per-dim val metrics land automatically in evaluate() (train_act.py
+#     bugfix + feature).  Expected: val/accuracy/ang.y trivially 1.0;
+#     val/motion_accuracy/lin.x is the single hardest axis.
+#
+# Expected outcome
+# ----------------
+# If prev_action works as predicted, motion_accuracy should land in the
+# 0.70-0.85 range (somewhere between v6b 0.52 and OLS(prev+state) 0.93).
+# The OLS baseline is a hard ceiling only for linear models; a deep
+# policy with vision-conditioned corrections might exceed it, but the
+# honest expectation is "close to it, not past it."
+#
+# Eval protocol
+# -------------
+# Teacher-forced both train and eval: ground-truth action[t-1] at both.
+# This measures the architectural ceiling -- "does 1-step action history
+# unlock what's in the dataset?"  If v8 beats v6b meaningfully, we know
+# the signal is there and a follow-up v9 can address exposure bias with
+# autoregressive eval or scheduled sampling.  If v8 doesn't move the
+# number, prev_action is a dead end for this policy and we save the
+# extra runs.
+#
+# Launch:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=<GPU> \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v8.yaml
+
+run_name: v8_prevact_3cam_170_30
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 30
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  # Keep stripping leaky state channels.  Even with prev_action in, the
+  # tcp_velocity.* / tcp_error.* columns are still high-corr shortcuts
+  # to action[t]; leaving them would undo the whole point of v8.
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.0
+
+  # v8 headline change: fetch action[t-1] per sample and concat it
+  # onto observation.state.  Zero-filled at the first frame of each
+  # episode (LeRobot marks that slot as action_is_pad).
+  previous_action:
+    enable: true
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  # Same step count as v6b so curves are directly comparable.  With
+  # a 3x smaller model and 2x less frequent eval, wall-clock should
+  # drop from ~6 h (v6b full 80k budget) to ~3-3.5 h.
+  steps: 80_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+action_weighting:
+  enable: false
+
+early_stopping:
+  enable: true
+  metric: val/motion_accuracy
+  mode: maximize
+  patience_steps: 12_000
+  min_delta: 0.005
+  min_steps: 15_000
+
+evaluation:
+  # 2_000 instead of 1_000 (v6b).  Each full-val eval is ~5 min.
+  eval_freq: 2_000
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v8", "3cam", "201ep", "classification", "prev-action", "no-vae", "small"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  # Shrunk from (512, 8, 3200, 4) -> (256, 8, 1024, 2).  Head count
+  # kept at 8 because dim_model=256 still divides by 8 cleanly
+  # (256/8=32 per head).
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  # CVAE off -- incompatible with classification objective.
+  use_vae: false
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 0.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: true
+
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: IDENTITY

@@ -142,23 +142,37 @@ def split_episodes(n_episodes: int, n_val: int, seed: int) -> tuple[list[int], l
     return train, val
 
 
-def build_delta_timestamps(fps: int, policy_cfg: ACTConfig) -> dict[str, list[float]]:
+def build_delta_timestamps(
+    fps: int,
+    policy_cfg: ACTConfig,
+    include_prev_action: bool = False,
+) -> dict[str, list[float]]:
     """LeRobotDataset delta_timestamps for ACT.
 
     ACT has ``observation_delta_indices = None`` (single-frame obs) and
     ``action_delta_indices = [0, 1, ..., chunk_size-1]``.  Returning a dict
     with only ``action`` means observations stay scalar-in-time (shape
     (B, C, H, W) rather than (B, 1, C, H, W)).
+
+    v8 prev_action: prepend a single ``-1/fps`` past step to the action
+    delta list, so each batch carries ``action[t-1]`` as the 0-th slot
+    of its action tensor.  The training loop splits this off and concats
+    it into ``observation.state`` before the policy sees the batch.  At
+    episode start LeRobot marks ``action_is_pad[:, 0] = True`` because
+    the negative delta falls before episode 0.
     """
     dt = 1.0 / fps
-    act_ts = [i * dt for i in policy_cfg.action_delta_indices]
-    return {"action": act_ts}
+    idxs = list(policy_cfg.action_delta_indices)
+    if include_prev_action:
+        idxs = [-1] + idxs
+    return {"action": [i * dt for i in idxs]}
 
 
 def select_policy_features(
     ds_meta,
     camera_keys: list[str],
     state_keep_idx: list[int] | None = None,
+    prev_action_dim: int = 0,
 ) -> tuple[dict, dict]:
     """Filter dataset features to the cameras requested by ``camera_keys``.
 
@@ -171,6 +185,14 @@ def select_policy_features(
     state projection sized for the filtered state.  The actual channel
     selection on each batch happens via ``_apply_state_filter_to_batch`` in
     the train/eval loops.
+
+    If ``prev_action_dim > 0`` (v8 prev_action feature), further extend the
+    state shape by that many channels.  The additional channels are populated
+    at batch time by ``apply_prev_action_to_batch`` from ``action[t-1]``,
+    concatenated onto the already state-filtered observation.state.  ACT
+    builds a single ``Linear(state_dim, dim_model)`` projection for the
+    state token, so widening that vector is the cleanest way to give the
+    policy an extra input without modifying the encoder architecture.
     """
     from dataclasses import replace
 
@@ -182,10 +204,12 @@ def select_policy_features(
             continue
         if v.type is FeatureType.VISUAL and k not in camera_keys:
             continue
-        # Rewrite observation.state shape if the leak-strip filter is on.
-        if k == "observation.state" and state_keep_idx is not None:
-            new_shape = (len(state_keep_idx),)
-            v = replace(v, shape=new_shape)
+        # Rewrite observation.state shape for state-filter / prev_action.
+        if k == "observation.state":
+            base = len(state_keep_idx) if state_keep_idx is not None else v.shape[0]
+            new_dim = base + int(prev_action_dim)
+            if new_dim != v.shape[0]:
+                v = replace(v, shape=(new_dim,))
         input_features[k] = v
     missing = [c for c in camera_keys if c not in input_features]
     if missing:
@@ -289,6 +313,94 @@ def apply_state_filter_to_batch(
     return batch
 
 
+def apply_prev_action_to_batch(batch: dict, enabled: bool) -> dict:
+    """Pop ``action[t-1]`` off the front of the action chunk and concat it
+    into ``observation.state`` (v8 prev_action input).
+
+    Precondition
+    ------------
+    ``make_datasets`` was called with ``include_prev_action=True``, so the
+    dataset's ``delta_timestamps["action"]`` includes a ``-1`` prepended
+    index and each batch carries an action tensor of shape
+    ``(B, chunk_size + 1, A)`` rather than the usual ``(B, chunk_size, A)``.
+
+    Transform
+    ---------
+    * ``prev_action = action[:, 0, :]``  (B, A)
+    * Zero ``prev_action`` on rows where ``action_is_pad[:, 0]`` is True
+      (LeRobot marks the slot as pad when the -1 offset falls before the
+      episode start).  This matches how the OLS(prev_a) baseline was
+      computed: zero-fill at episode boundaries.
+    * Truncate ``batch["action"]`` and ``batch["action_is_pad"]`` back to
+      their nominal chunk-only shapes ``(B, chunk_size, A)`` / ``(B, chunk_size)``
+      so the policy's head, loss, and eval metrics see the same shapes
+      they did pre-v8.
+    * Append ``prev_action`` to the end of ``observation.state`` on the
+      last axis.  The state projection was widened by ``A`` dims in
+      ``select_policy_features`` so it can absorb this.
+
+    Ordering matters: run this AFTER state filtering (so the leaky
+    state channels are gone before prev_action is appended) and BEFORE
+    the preprocessor (so prev_action gets normalized with state stats).
+
+    No-op when ``enabled=False`` or ``action`` has only the chunk size.
+    """
+    if not enabled:
+        return batch
+    action = batch.get("action")
+    if action is None or action.dim() != 3 or action.shape[1] < 2:
+        return batch
+    is_pad = batch.get("action_is_pad")
+    prev_action = action[:, 0, :]  # (B, A)
+    if is_pad is not None:
+        prev_is_pad = is_pad[:, 0].unsqueeze(-1)  # (B, 1)
+        prev_action = torch.where(
+            prev_is_pad, torch.zeros_like(prev_action), prev_action
+        )
+        batch["action_is_pad"] = is_pad[:, 1:].contiguous()
+    batch["action"] = action[:, 1:, :].contiguous()
+    state = batch.get("observation.state")
+    if state is not None:
+        batch["observation.state"] = torch.cat([state, prev_action], dim=-1)
+    return batch
+
+
+def extend_state_stats_with_prev_action(stats: dict, action_dim: int) -> dict:
+    """Widen ``observation.state`` stats by ``action_dim`` trailing channels
+    populated from ``action`` stats.
+
+    Called once at train-time setup when ``previous_action.enable=true``.
+    After ``filter_state_stats`` has reduced state stats to ``D`` rows,
+    we append ``action_dim`` more rows so the NormalizerProcessorStep's
+    state mean/std vectors line up with the post-concat tensor shape.
+    We reuse the action stats as a reasonable proxy for prev_action stats
+    (prev_action values are drawn from the same action distribution, just
+    shifted back one frame).
+    """
+    if action_dim <= 0:
+        return stats
+    act = stats.get("action")
+    state = stats.get("observation.state")
+    if act is None or state is None:
+        return stats
+    out_state: dict = {}
+    for k, v in state.items():
+        arr = np.asarray(v)
+        if k == "count":
+            out_state[k] = v  # unchanged
+            continue
+        av = act.get(k)
+        if av is None or arr.ndim < 1:
+            out_state[k] = v
+            continue
+        av_arr = np.asarray(av)
+        if av_arr.shape[0] != action_dim:
+            out_state[k] = v
+            continue
+        out_state[k] = np.concatenate([arr, av_arr.astype(arr.dtype)], axis=0)
+    return {**stats, "observation.state": out_state}
+
+
 def compute_train_only_stats(
     train_ds: LeRobotDataset,
     baseline_stats: dict,
@@ -390,13 +502,20 @@ def trim_episode_tails(
 
 def make_datasets(
     cfg: dict, policy_cfg: ACTConfig
-) -> tuple[LeRobotDataset, LeRobotDataset, list[int] | None]:
-    """Build train/val datasets and return them along with the state-keep
-    indices (or ``None`` if no state filter).  The caller threads
-    ``state_keep_idx`` through the train/eval loops to slice each batch's
-    ``observation.state`` before the preprocessor sees it.
+) -> tuple[LeRobotDataset, LeRobotDataset, list[int] | None, bool]:
+    """Build train/val datasets and return them along with:
+    * ``state_keep_idx``: indices of observation.state channels to keep
+      (or ``None`` if no state filter).
+    * ``use_prev_action``: True when ``dataset.previous_action.enable: true``;
+      each batch's action tensor will carry an extra past step at slot 0
+      that the training/eval loops pop off via ``apply_prev_action_to_batch``.
+
+    The caller threads both flags through the train/eval loops.
     """
     ds_cfg = cfg["dataset"]
+    prev_cfg = ds_cfg.get("previous_action") or {}
+    use_prev_action = bool(prev_cfg.get("enable", False))
+
     probe = LeRobotDataset(
         repo_id=ds_cfg["repo_id"],
         root=ds_cfg["root"],
@@ -417,8 +536,21 @@ def make_datasets(
             "State filter: keeping %d/%d columns -- kept=%s dropped=%s",
             len(kept), len(names), kept, dropped,
         )
+
+    action_dim = int(probe.meta.features["action"]["shape"][0])
+    prev_action_dim = action_dim if use_prev_action else 0
+    if use_prev_action:
+        log.info(
+            "Previous-action input ENABLED: extending observation.state by %d dims "
+            "(action[t-1], zero-filled at episode boundary).",
+            prev_action_dim,
+        )
+
     input_features, output_features = select_policy_features(
-        probe.meta, ds_cfg["cameras"], state_keep_idx=state_keep_idx,
+        probe.meta,
+        ds_cfg["cameras"],
+        state_keep_idx=state_keep_idx,
+        prev_action_dim=prev_action_dim,
     )
     policy_cfg.input_features = input_features
     policy_cfg.output_features = output_features
@@ -430,7 +562,9 @@ def make_datasets(
         n_episodes, len(train_eps), len(val_eps), cfg["seed"],
     )
 
-    delta_ts = build_delta_timestamps(fps, policy_cfg)
+    delta_ts = build_delta_timestamps(
+        fps, policy_cfg, include_prev_action=use_prev_action
+    )
 
     train_ds = LeRobotDataset(
         repo_id=ds_cfg["repo_id"],
@@ -457,7 +591,7 @@ def make_datasets(
             unused, ds_cfg["cameras"],
         )
 
-    return train_ds, val_ds, state_keep_idx
+    return train_ds, val_ds, state_keep_idx, use_prev_action
 
 
 def cycle(iterable: Iterable):
@@ -877,6 +1011,8 @@ def evaluate(
     device: torch.device,
     autocast_ctx,
     state_keep_t: torch.Tensor | None = None,
+    action_dim_names: list[str] | None = None,
+    use_prev_action: bool = False,
 ) -> dict[str, float]:
     """Compute val/l1_loss + val/action_mse_norm on (up to) ``max_batches`` batches.
 
@@ -934,6 +1070,10 @@ def evaluate(
         # normalizer runs on device.
         batch = batch_to_device(batch, device)
         batch = apply_state_filter_to_batch(batch, state_keep_t)
+        # v8: teacher-forced eval protocol -- always consume the ground-truth
+        # action[t-1] off the dataset's action tensor.  See the train-loop
+        # comment for the exposure-bias caveat.
+        batch = apply_prev_action_to_batch(batch, use_prev_action)
         batch = preprocessor(batch)
 
         with autocast_ctx():
@@ -966,16 +1106,36 @@ def evaluate(
 
             target_cls = snap_to_class(target)
             pred_cls = snap_to_class(pred)
-            correct = (target_cls == pred_cls).float()
+            correct = (target_cls == pred_cls).float()  # (B, T, A)
             # per-(pos, dim) accuracy over all non-pad positions.
             _add("val/accuracy",
                  float((correct * mask).sum().item()),
                  n_valid * A)
-            motion_mask = (target_cls != 1).float() * mask
-            motion_denom = float(motion_mask.sum().item())
+            motion_cells = (target_cls != 1).float() * mask  # (B, T, A)
+            motion_denom = float(motion_cells.sum().item())
             _add("val/motion_accuracy",
-                 float((correct * motion_mask).sum().item()),
+                 float((correct * motion_cells).sum().item()),
                  motion_denom)
+
+            # Per-dim breakdown: extremely useful for locating which action
+            # axis the policy is failing on.  For sfp teleop, angular.y is
+            # ~99.96% zero in the whole dataset, so val/motion_accuracy/ang.y
+            # is typically undefined (NaN) or trivially 1.0, while the other
+            # five dims carry the real signal.  Each dim contributes n_valid
+            # positions to the overall accuracy and a variable number of
+            # motion positions.
+            names = action_dim_names if action_dim_names is not None else [f"dim{a}" for a in range(A)]
+            for a in range(A):
+                n = names[a] if a < len(names) else f"dim{a}"
+                corr_a = correct[..., a] * mask.squeeze(-1)  # (B, T)
+                _add(f"val/accuracy/{n}",
+                     float(corr_a.sum().item()),
+                     n_valid)
+                mot_a = motion_cells[..., a]  # (B, T)
+                mot_denom_a = float(mot_a.sum().item())
+                _add(f"val/motion_accuracy/{n}",
+                     float((correct[..., a] * mot_a).sum().item()),
+                     mot_denom_a)
 
     # predict_action_chunk doesn't mutate the internal action queue (it rebuilds
     # it), but select_action's queue may have leftover entries.  Reset to be safe
@@ -1065,11 +1225,18 @@ def train(cfg: dict) -> None:
     policy_cfg = build_act_config(cfg["policy"], device=cfg["device"])
 
     # --- Datasets ---
-    train_ds, val_ds, state_keep_idx = make_datasets(cfg, policy_cfg)
+    train_ds, val_ds, state_keep_idx, use_prev_action = make_datasets(cfg, policy_cfg)
     log.info(
         "Train: %d ep / %d frames | Val: %d ep / %d frames",
         train_ds.num_episodes, train_ds.num_frames, val_ds.num_episodes, val_ds.num_frames,
     )
+    # Short labels for per-dim val metrics (wandb-friendly).  Falls back to
+    # dim{i} if the dataset doesn't carry feature names.
+    _raw_act_names = train_ds.meta.features.get("action", {}).get("names") or []
+    action_dim_names = [
+        n.replace("linear.", "lin.").replace("angular.", "ang.")
+        for n in _raw_act_names
+    ]
 
     # Materialize state_keep_idx as a tensor once; moved to device lazily per-batch.
     state_keep_t: torch.Tensor | None = (
@@ -1116,6 +1283,9 @@ def train(cfg: dict) -> None:
         log.info("Dataset stats recomputed on train episodes only.")
     if state_keep_idx is not None:
         baseline_stats = filter_state_stats(baseline_stats, state_keep_idx)
+    if use_prev_action:
+        action_dim = int(policy_cfg.action_feature.shape[0])
+        baseline_stats = extend_state_stats_with_prev_action(baseline_stats, action_dim)
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=policy_cfg,
@@ -1256,6 +1426,10 @@ def train(cfg: dict) -> None:
         # preprocessor and action-weighter see the state.  No-op if the
         # dataset.state_drop_prefixes config key is unset.
         batch = apply_state_filter_to_batch(batch, state_keep_t)
+        # v8: pop the extra past-step off the action chunk and append it to
+        # observation.state, zeroed at episode boundaries.  No-op when
+        # previous_action.enable is false (action shape is already chunk_size).
+        batch = apply_prev_action_to_batch(batch, use_prev_action)
         # Augment BEFORE the preprocessor so [0,1]-space transforms make sense.
         batch = aug(batch)
         # Action weights are computed from RAW (un-normalized) actions, so
@@ -1334,6 +1508,8 @@ def train(cfg: dict) -> None:
                 policy, preprocessor, postprocessor,
                 val_loader, eval_batches_cfg, device, autocast_ctx,
                 state_keep_t=state_keep_t,
+                action_dim_names=action_dim_names,
+                use_prev_action=use_prev_action,
             )
             val_metrics["val/eval_s"] = time.perf_counter() - t0
             log.info("eval @ step %d: %s", step, {k: round(v, 5) for k, v in val_metrics.items()})

@@ -50,6 +50,7 @@ from lerobot.configs.types import PolicyFeature
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from modeling_discrete_act import DiscreteACTPolicy, snap_to_class  # noqa: E402
+from train_act import compute_train_only_stats  # noqa: E402
 
 
 def split_episodes(n_episodes: int, n_val: int, seed: int):
@@ -157,7 +158,7 @@ def evaluate_run(
     raw_root = dataset_root_override or "/scratch2/atang/ws_aic/teleop-dataset"
     probe = LeRobotDataset(repo_id=ds_cfg["repo_id"], root=raw_root, video_backend="pyav")
     n_val = val_num_episodes_override if val_num_episodes_override is not None else ds_cfg["val_num_episodes"]
-    _, val_eps = split_episodes(probe.num_episodes, n_val, run_cfg["seed"])
+    train_eps, val_eps = split_episodes(probe.num_episodes, n_val, run_cfg["seed"])
     fps = probe.fps
     dt = 1.0 / fps
     delta_ts = {"action": [i * dt for i in cfg.action_delta_indices]}
@@ -174,6 +175,24 @@ def evaluate_run(
     # Resolve state keep idx for the run, and build a filtered-stats preprocessor.
     keep_idx = get_state_keep_idx(run_cfg, ds.meta)
     baseline_stats = ds.meta.stats
+
+    # If the run was trained with ``stats_train_only: true``, recompute the
+    # same train-only stats here so our preprocessor matches exactly what the
+    # policy saw at train time.  Otherwise ``ds.meta.stats`` (all-episode
+    # stats) introduces a small systematic bias in l1_phys for regression
+    # runs.  For classification runs this doesn't change numbers because
+    # ACTION normalization is IDENTITY, but doing it uniformly keeps the
+    # observation-state normalization honest.
+    if bool(run_cfg.get("dataset", {}).get("stats_train_only", False)):
+        train_ds = LeRobotDataset(
+            repo_id=ds_cfg["repo_id"],
+            root=raw_root,
+            episodes=train_eps,
+            video_backend="pyav",
+        )
+        baseline_stats = compute_train_only_stats(train_ds, baseline_stats)
+        del train_ds
+
     if keep_idx is not None:
         # filter stats
         src = baseline_stats["observation.state"]
