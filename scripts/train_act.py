@@ -823,24 +823,43 @@ class EarlyStopper:
 
         Rules as of v6:
           * Any STRICT improvement updates ``self.best`` + ``best_step``.
-          * Only a MIN_DELTA improvement resets the patience counter.
-        The distinction lets the ``best`` checkpoint follow every tiny gain
-        while the stopper still gives up on a plateau.
+          * Only a MIN_DELTA improvement (vs. the PRIOR best) resets the
+            patience counter.
+
+        v6 bugfix: in the first v6 run the two checks shared ``self.best``
+        state -- by the time ``_is_delta_improvement`` ran, ``self.best``
+        had already been set to ``value`` by the strict-improvement branch,
+        so the delta check always read ``value - min_delta > value`` and
+        ``last_improve_step`` never advanced.  That caused the stopper to
+        fire the instant ``step >= min_steps``.  We now snapshot the prior
+        best and run BOTH checks against it, which is the correct
+        semantics.
         """
         if value is None:
             return False
-        if self._is_strict_improvement(value):
+        prior_best = self.best
+        # Strict improvement: promote best + best_step (used by the
+        # checkpoint bookkeeper to advance the `best` symlink).
+        if self._mode_cmp_strict(value, prior_best):
             self.best = value
             self.best_step = step
-        if self._is_delta_improvement(value) or step == 0:
-            # ``step == 0`` isn't normally reachable, but keeps init sane
-            # if someone drives this stopper from tests.
+        # Delta improvement: reset patience.  Compared against PRIOR best.
+        if self._mode_cmp_delta(value, prior_best) or step == 0:
             self.last_improve_step = step
         if not self.enabled:
             return False
         if step < self.min_steps:
             return False
         return (step - self.last_improve_step) >= self.patience_steps
+
+    # Internal: comparison against an arbitrary reference (not self.best).
+    def _mode_cmp_strict(self, val: float, ref: float) -> bool:
+        return val < ref if self.mode == "minimize" else val > ref
+
+    def _mode_cmp_delta(self, val: float, ref: float) -> bool:
+        if self.mode == "minimize":
+            return val + self.min_delta < ref
+        return val - self.min_delta > ref
 
 
 # ---------------------------------------------------------------------------

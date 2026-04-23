@@ -111,7 +111,13 @@ def metrics(pred_phys: np.ndarray, target_phys: np.ndarray) -> dict:
     }
 
 
-def evaluate_run(run_dir: Path, ckpt: str = "best", device: str = "cuda:0") -> dict:
+def evaluate_run(
+    run_dir: Path,
+    ckpt: str = "best",
+    device: str = "cuda:0",
+    val_num_episodes_override: int | None = None,
+    dataset_root_override: str | None = None,
+) -> dict:
     with open(run_dir / "config.yaml") as f:
         run_cfg = yaml.safe_load(f)
 
@@ -143,12 +149,15 @@ def evaluate_run(run_dir: Path, ckpt: str = "best", device: str = "cuda:0") -> d
 
     policy.to(device).eval()
 
-    # Build the RAW val dataset (same seed=42 split as training + baselines).
+    # Build the RAW val dataset.  By default we use the run's own val split
+    # (same seed+count it was trained against); passing --val-num-episodes
+    # lets the caller force a common split across multiple runs so their
+    # numbers are directly comparable.
     ds_cfg = run_cfg["dataset"]
-    raw_root = "/scratch2/atang/ws_aic/teleop-dataset"  # always raw for cross-eval
-    # Need delta_timestamps so chunk dim aligns with policy expectations.
+    raw_root = dataset_root_override or "/scratch2/atang/ws_aic/teleop-dataset"
     probe = LeRobotDataset(repo_id=ds_cfg["repo_id"], root=raw_root, video_backend="pyav")
-    _, val_eps = split_episodes(probe.num_episodes, ds_cfg["val_num_episodes"], run_cfg["seed"])
+    n_val = val_num_episodes_override if val_num_episodes_override is not None else ds_cfg["val_num_episodes"]
+    _, val_eps = split_episodes(probe.num_episodes, n_val, run_cfg["seed"])
     fps = probe.fps
     dt = 1.0 / fps
     delta_ts = {"action": [i * dt for i in cfg.action_delta_indices]}
@@ -246,10 +255,15 @@ def main():
     p.add_argument("--runs", nargs="+", default=[
         "outputs/act_sfp/v5_clean_baseline",
         "outputs/act_sfp/v5_classification",
+        "outputs/act_sfp/v6_3cam_170_30",
     ])
     p.add_argument("--ckpt", default="best")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--workspace", default="/scratch2/atang/ws_aic")
+    p.add_argument("--val-num-episodes", type=int, default=None,
+                   help="Override val episode count (common across all runs)")
+    p.add_argument("--dataset-root", default=None,
+                   help="Override dataset root for every run's eval")
     args = p.parse_args()
 
     print(f"{'run':<30s} {'ckpt':<20s} {'l1_phys':>10s} {'mse_phys':>11s} {'l1_trans':>10s} {'l1_ang':>10s} {'acc':>7s} {'motion_acc':>11s}")
@@ -260,7 +274,11 @@ def main():
             print(f"  (skip) {rel} -- not found")
             continue
         try:
-            m = evaluate_run(run_dir, ckpt=args.ckpt, device=args.device)
+            m = evaluate_run(
+                run_dir, ckpt=args.ckpt, device=args.device,
+                val_num_episodes_override=args.val_num_episodes,
+                dataset_root_override=args.dataset_root,
+            )
             tag = f"{rel.split('/')[-1]}"
             # Read actual step the best ckpt points to
             ck = (run_dir / "checkpoints" / args.ckpt).resolve().name
