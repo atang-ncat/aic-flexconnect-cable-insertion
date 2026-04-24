@@ -46,6 +46,18 @@ SLOW_ANGULAR_VEL = 0.02
 FAST_LINEAR_VEL = 0.1
 FAST_ANGULAR_VEL = 0.1
 
+# EMA smoothing on the published twist.  alpha is the per-tick weight on
+# the new (raw keyboard) command; (1 - alpha) carries over the previous
+# smoothed value.  At 25 Hz (40 ms ticks):
+#   alpha=0.5  -> 50% catch-up per tick, ~63% within 80 ms (2 ticks)
+#   alpha=0.3  -> noticeably softer
+#   alpha=1.0  -> no smoothing (legacy step-function behavior)
+# A small alpha is what the cable-insertion policy needs: it converts the
+# {-0.1, 0, +0.1} keyboard step-functions into continuous ramps so the
+# recorded actions are smooth out of the box (no SavGol post-pass needed)
+# and the trained policy emits smooth velocities at inference.
+ACTION_SMOOTHING_ALPHA = 0.5
+
 KEY_MAPPINGS = {
     "d": (1, 0, 0, 0, 0, 0),  # +linear.x
     "a": (-1, 0, 0, 0, 0, 0),  # -linear.x
@@ -108,6 +120,11 @@ class AICCartesianTeleoperatorNode(Node):
         self.linear_vel = FAST_LINEAR_VEL  # Linear velocity (m/s)
         self.angular_vel = FAST_ANGULAR_VEL  # Angular velocity (rad/s)
         self.frame_id = "gripper/tcp"
+
+        # Persistent EMA state for action smoothing.  Held across ticks so
+        # the published twist ramps smoothly between the {-vel, 0, +vel}
+        # raw keyboard targets instead of stepping instantly.
+        self._smoothed_twist = np.zeros(6)
 
     def on_key_press(self, key):
         """Callback for keyboard listener when a key is pressed."""
@@ -179,13 +196,32 @@ class AICCartesianTeleoperatorNode(Node):
                 self.linear_vel = FAST_LINEAR_VEL
                 self.angular_vel = FAST_ANGULAR_VEL
 
+        # EMA smoothing: each tick the published twist moves a fraction
+        # ``ACTION_SMOOTHING_ALPHA`` of the way from its current value
+        # toward the raw key-driven target.  When the operator releases a
+        # key the target snaps to 0 and the smoothed value decays back
+        # toward 0 over a few ticks rather than stepping instantly.  This
+        # is what makes the recorded action stream continuous-valued
+        # rather than {-0.1, 0, +0.1}-discrete.
+        self._smoothed_twist = (
+            ACTION_SMOOTHING_ALPHA * input_twist
+            + (1.0 - ACTION_SMOOTHING_ALPHA) * self._smoothed_twist
+        )
+        # Snap-to-zero deadband: once the smoothed value gets very small
+        # (below ~0.5% of FAST_LINEAR_VEL), force it to exact 0 so we
+        # don't carry an asymptotic micro-velocity for many ticks after
+        # a key release.  Avoids polluting the dataset with permanent
+        # millimeter-per-second drift.
+        deadband = 5e-4
+        self._smoothed_twist[np.abs(self._smoothed_twist) < deadband] = 0.0
+
         twist = Twist()
-        twist.linear.x = input_twist[0]
-        twist.linear.y = input_twist[1]
-        twist.linear.z = input_twist[2]
-        twist.angular.x = input_twist[3]
-        twist.angular.y = input_twist[4]
-        twist.angular.z = input_twist[5]
+        twist.linear.x = float(self._smoothed_twist[0])
+        twist.linear.y = float(self._smoothed_twist[1])
+        twist.linear.z = float(self._smoothed_twist[2])
+        twist.angular.x = float(self._smoothed_twist[3])
+        twist.angular.y = float(self._smoothed_twist[4])
+        twist.angular.z = float(self._smoothed_twist[5])
 
         self.motion_update_publisher.publish(
             self.generate_velocity_motion_update(twist=twist, frame_id=self.frame_id)
