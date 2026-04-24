@@ -40,23 +40,19 @@ If you see `26 fields` or `wrench in schema: False`, the driver edits are not ac
 
 ## Step 1 — Launch Gazebo
 
-Terminal 1, SFP scene:
+> **Paste tip:** copy each command as **one single line** — do not use backslash line continuations when pasting into the terminal. Some terminals insert invisible trailing whitespace after `\` which breaks the continuation and causes errors like `malformed launch argument ' '`. If a command is shown here with `\` continuations for readability, join them into one line before pasting.
+>
+> **Path note:** inside the `aic_eval` distrobox your prompt looks like `atang@aic_eval:...`. Inside the container, `/scratch2/...` does not exist — use `/run/host/scratch2/...` instead. All shell commands below assume the distrobox.
+
+Terminal 1, SFP scene (single line):
 
 ```bash
-source ~/lab/ws_aic/setup_dev.sh    # adjust path to your workspace
-
-ros2 launch aic_bringup aic_gz_bringup.launch.py \
-  ground_truth:=true start_aic_engine:=false \
-  spawn_task_board:=true spawn_cable:=true \
-  attach_cable_to_gripper:=true \
-  cable_type:=sfp_sc_cable \
-  nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005 \
-  sc_port_0_present:=true sc_port_0_translation:=-0.04
+source ~/lab/ws_aic/setup_dev.sh && ros2 launch aic_bringup aic_gz_bringup.launch.py ground_truth:=true start_aic_engine:=false spawn_task_board:=true spawn_cable:=true attach_cable_to_gripper:=true cable_type:=sfp_sc_cable nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005 sc_port_0_present:=true sc_port_0_translation:=-0.04
 ```
 
-For SC, replace the last two args with an SC-focused scene and `cable_type:=sfp_sc_cable_reversed` — see `teleop_guide.md` section 1 for the full SC command.
+For SC, swap `cable_type:=sfp_sc_cable_reversed` and the SC rail/mount args — see `teleop_guide.md` section 1 for the full SC command.
 
-Wait for Gazebo to fully settle. You should see the robot arm, the task board, the plug grasped by the gripper.
+Wait for Gazebo to fully settle. You should see the robot arm, the task board, and the plug grasped by the gripper.
 
 ---
 
@@ -115,17 +111,23 @@ ls "$DATASET_ROOT" 2>/dev/null && echo "EXISTS — pick a different path or dele
 
 ## Step 4 — Start lerobot-record
 
-Terminal 2 (after sanity checks passed):
+Terminal 2 (after sanity checks passed). Copy-paste the single-line form below. Do **not** use the readable version's backslash line continuations — some terminals insert trailing whitespace that breaks them:
 
 ```bash
-cd /scratch2/atang/ws_aic/src/aic
+cd /run/host/scratch2/atang/ws_aic/src/aic && pixi run lerobot-record --robot.type=aic_controller --robot.id=aic --teleop.type=aic_keyboard_ee --teleop.id=aic --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link --dataset.repo_id=local/teleop_sfp_ft --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset-ft-v1 --dataset.single_task="insert SFP" --dataset.push_to_hub=false --dataset.private=true --play_sounds=false --display_data=true
+```
+
+Readable version (for reference only):
+
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic
 
 pixi run lerobot-record \
   --robot.type=aic_controller --robot.id=aic \
   --teleop.type=aic_keyboard_ee --teleop.id=aic \
   --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
   --dataset.repo_id=local/teleop_sfp_ft \
-  --dataset.root=/scratch2/atang/ws_aic/teleop-dataset-ft-v1 \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset-ft-v1 \
   --dataset.single_task="insert SFP" \
   --dataset.push_to_hub=false \
   --dataset.private=true \
