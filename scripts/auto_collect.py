@@ -1040,6 +1040,43 @@ def main():
         return
     logger.info("TF ready.")
 
+    # Sanity check: is the cable still in the gripper, or did the
+    # CablePlugin's startup race drop it on the floor?  The cable's
+    # plug_link is supposed to be held at roughly the gripper's TCP
+    # height (~0.25-0.35 m in world frame).  If it's near the ground
+    # (z < 0.1 m) the gripper lost the grasp and the whole episode
+    # is doomed -- abort now with an actionable message instead of
+    # letting the operator wait through a 30-second approach that
+    # can never converge.
+    try:
+        plug_tf = node.lookup_tf("base_link", plug_frame)
+        plug_z_in_base = plug_tf.transform.translation.z
+        # base_link is ~0.94 m below world origin on this rig; a cable
+        # grasped near world z~0.3 shows up near base-link z~-0.65.  A
+        # cable on the floor (world z~0.02) shows up near base-link
+        # z~-0.92.  Threshold chosen conservatively for the default
+        # robot home pose.
+        if plug_z_in_base < -0.85:
+            logger.error(
+                "Cable appears to be on the table, not in the gripper!\n"
+                f"  {plug_frame} z-in-base_link = {plug_z_in_base:.3f} m\n"
+                "  Expected something like -0.6 to -0.7 when grasped.\n\n"
+                "This is the CablePlugin startup race in aic_gazebo/src/CablePlugin.cc:\n"
+                "the plugin won't pin the cable in place until it finds\n"
+                "ur5e::ati/tool_link in the ECM, and during the ~2 s it takes\n"
+                "for the arm model to load, the cable free-falls under gravity.\n"
+                "By the time the plugin is ready to attach, the cable is too far\n"
+                "from the gripper for the fixed joint to pull it back.\n\n"
+                "Kill Gazebo (Ctrl+C in terminal 1) and relaunch.  The race is\n"
+                "CPU-load-dependent, so it often resolves on the next try.  If\n"
+                "it happens consistently, we need a plugin-side fix."
+            )
+            rclpy.shutdown()
+            return
+        logger.info(f"Cable grasp OK: {plug_frame} z-in-base_link = {plug_z_in_base:.3f} m")
+    except TransformException as e:
+        logger.warning(f"Could not check cable grasp state: {e}")
+
     # Confirm we're actually receiving wrench updates (tared).  If tare is
     # still zeros at this point, either the controller didn't tare or we
     # grabbed the snapshot too early.
