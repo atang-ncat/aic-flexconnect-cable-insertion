@@ -112,6 +112,7 @@ This is the reference index of every meaningful problem identified in our SFP/SC
 - New `--plug-type {sfp,sc}` selects gains + frames + task string per profile.
 - New `--dry-run` runs one episode without writing a dataset — catches bringup/TF/camera/F/T problems in 30 s before committing to a long session.
 - Pre-flight F/T publishing + tare sanity checks at startup with actionable error messages.
+- **Direct `/scoring/tf` subscription with `TRANSIENT_LOCAL` QoS**, bypassing the AIC bringup's lazy relay.  The relay (`topic_tools/relay` with `lazy: True` in `aic_gz_bringup.launch.py`) misses latched static messages — specifically `/task_board/pose_static`, which is the only source of `task_board/*` / `nic_card_mount_*` / `sfp_port_*` TF frames.  Without this fix, auto_collect could see `cable_0/*` frames (dynamic, continuously republished) but not the port frames, so TF lookups timed out every run.  Discovered 2026-04-24 via direct `tf2_monitor` inspection.
 
 See `docs/auto_collection_guide.md` for updated commands.
 

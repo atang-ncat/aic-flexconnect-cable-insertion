@@ -59,7 +59,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.time import Time
 from rclpy.duration import Duration
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    qos_profile_sensor_data,
+    QoSProfile,
+    QoSDurabilityPolicy,
+    QoSReliabilityPolicy,
+)
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros import TransformException
@@ -72,6 +77,7 @@ from aic_control_interfaces.msg import (
 from geometry_msgs.msg import Twist, Vector3, Wrench, WrenchStamped
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
 
 try:
     from ros_gz_interfaces.msg import Contacts
@@ -203,9 +209,51 @@ class AutoCollectNode(Node):
             self._wrench_cb, qos_profile_sensor_data,
         )
 
+        # Ground-truth TF bootstrap.  The AIC bringup has a
+        # `topic_tools/relay` node forwarding /scoring/tf -> /tf with
+        # `lazy: True`.  Latched static messages (specifically
+        # /task_board/pose_static, which is published ONCE at startup via
+        # TRANSIENT_LOCAL QoS) get lost because the relay only subscribes
+        # to its input after /tf has a subscriber, which happens too late
+        # to catch the initial latched message.  Dynamic frames like
+        # cable_0 still come through because they're re-published every
+        # tick.  This results in cable_0/* frames being available but
+        # task_board/* frames never appearing on /tf.
+        #
+        # Fix: subscribe directly to /scoring/tf ourselves with matching
+        # TRANSIENT_LOCAL QoS so we receive the latched static message,
+        # then feed each transform into our TF buffer via
+        # set_transform_static.  Also listen with default QoS for any
+        # late static updates (scene re-spawn etc).  The regular
+        # TransformListener still handles dynamic /tf transforms, so
+        # cable_0/* remains correctly updated live.
+        qos_latched = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            depth=10,
+        )
+        self.create_subscription(
+            TFMessage, "/scoring/tf",
+            self._scoring_tf_static_cb, qos_latched,
+        )
+
         self.motion_pub = self.create_publisher(
             MotionUpdate, "/aic_controller/pose_commands", 10,
         )
+
+    def _scoring_tf_static_cb(self, msg: TFMessage):
+        """Treat every transform on /scoring/tf (transient_local) as static.
+
+        The bridge publishes task_board/* here with TRANSIENT_LOCAL QoS and
+        never updates them (the task board doesn't move).  Feeding into
+        the buffer as static means they won't expire from the time-windowed
+        cache during long sessions.
+        """
+        for tf in msg.transforms:
+            try:
+                self.tf_buffer.set_transform_static(tf, "ground_truth_bootstrap")
+            except Exception as e:
+                logger.debug(f"set_transform_static skipped {tf.child_frame_id}: {e}")
 
     def _controller_state_cb(self, msg):
         self.last_controller_state = msg
