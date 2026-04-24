@@ -383,23 +383,6 @@ def launch_setup(context, *args, **kwargs):
         )
     )
 
-    # Delay cable spawn until after ur5e is fully created.  Without this
-    # the cable and the arm spawn in parallel; the cable's CablePlugin
-    # refuses to MakeStatic the cable until it can find the end-effector
-    # link (ur5e::ati/tool_link), and while it waits the cable free-falls
-    # under gravity and lands on the table ~0.5 m from the gripper.  Once
-    # the end effector finally appears, the attach joint tries to rigidly
-    # connect the (now fallen) cable to the gripper, which either teleports
-    # the arm or fails outright.  Gating on OnProcessExit(gz_spawn_entity)
-    # guarantees ur5e exists before the cable starts physics simulation.
-    delay_cable_spawn_after_arm = RegisterEventHandler(
-        event_handler=OnProcessExit(
-            target_action=gz_spawn_entity,
-            on_exit=[spawn_cable_launch],
-        ),
-        condition=IfCondition(spawn_cable),
-    )
-
     delay_initial_controller_after_broadcaster = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=joint_state_broadcaster_spawner,
@@ -439,9 +422,7 @@ def launch_setup(context, *args, **kwargs):
         ros_gz_bridge,
         gz_spawn_entity,
         spawn_task_board_launch,
-        # spawn_cable_launch is triggered indirectly via
-        # delay_cable_spawn_after_arm below so it runs AFTER ur5e is up.
-        delay_cable_spawn_after_arm,
+        spawn_cable_launch,
         ground_truth_tf_relay,
         ground_truth_static_tf_publisher,
         aic_engine,
