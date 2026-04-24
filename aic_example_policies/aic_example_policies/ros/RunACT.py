@@ -61,6 +61,9 @@ class RunACT(Policy):
         # -------------------------------------------------------------------------
         # Path to your checkpoint folder
         policy_path = Path("/scratch2/atang/ws_aic/outputs/act_sfp/act_sfp_20260422_164944/checkpoints/best")
+        # If running inside the docker container, /scratch2 is mapped to /run/host/scratch2
+        if not policy_path.exists() and Path("/run/host" + str(policy_path)).exists():
+            policy_path = Path("/run/host" + str(policy_path))
 
         # Load Config Manually (Fixes 'Draccus' error by removing unknown 'type' field)
         with open(policy_path / "config.json", "r") as f:
@@ -134,10 +137,11 @@ class RunACT(Policy):
         std: torch.Tensor,
     ) -> torch.Tensor:
         """Converts ROS Image -> Resized -> Permuted -> Normalized Tensor."""
-        # 1. Bytes to Numpy (H, W, C)
-        img_np = np.frombuffer(raw_img.data, dtype=np.uint8).reshape(
-            raw_img.height, raw_img.width, 3
-        )
+        from cv_bridge import CvBridge
+        bridge = CvBridge()
+        # 1. Use CvBridge to handle varying strides and encodings accurately
+        # Always decode to rgb8 since the LeRobot dataset expects standard RGB tensors
+        img_np = bridge.imgmsg_to_cv2(raw_img, desired_encoding="rgb8")
 
         # 2. Resize
         if scale != 1.0:
@@ -192,6 +196,25 @@ class RunACT(Policy):
         tcp_pose = obs_msg.controller_state.tcp_pose
         tcp_vel = obs_msg.controller_state.tcp_velocity
 
+        # The ACT dataset was collected using /joint_states natively, which alphabetizes joints.
+        # But aic_adapter explicitly reorders Observation.joint_states to structural order.
+        # We must re-alphabetize here to guarantee correct neural net feature matching.
+        target_joint_names = [
+            "elbow_joint",
+            "gripper",  # aic_adapter renamed it from 'gripper/left_finger_joint' to 'gripper'
+            "shoulder_lift_joint",
+            "shoulder_pan_joint",
+            "wrist_1_joint",
+            "wrist_2_joint",
+            "wrist_3_joint"
+        ]
+        joint_dict = dict(zip(obs_msg.joint_states.name, obs_msg.joint_states.position))
+        
+        # Recover the raw prismatic value (aic_adapter divided it by 2.0)
+        joint_dict["gripper"] *= 2.0
+        
+        ordered_joints = [joint_dict[name] for name in target_joint_names]
+
         state_np = np.array(
             [
                 # TCP Position (3)
@@ -213,8 +236,8 @@ class RunACT(Policy):
                 tcp_vel.angular.z,
                 # TCP Error (6)
                 *obs_msg.controller_state.tcp_error,
-                # Joint Positions (7)
-                *obs_msg.joint_states.position[:7],
+                # Joint Positions (7) - Alphabetized
+                *ordered_joints,
             ],
             dtype=np.float32,
         )
@@ -238,11 +261,13 @@ class RunACT(Policy):
         self.policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
 
-        start_time = time.time()
+        start_time = self.get_clock().now()
+        rate = self.create_rate(30.0)  # 30 Hz in simulation time!
+        duration_to_run = rclpy.time.Duration(seconds=30.0)
 
+        iteration = 0
         # Run inference for 30 seconds
-        while time.time() - start_time < 30.0:
-            loop_start = time.time()
+        while (self.get_clock().now() - start_time) < duration_to_run:
 
             # 1. Get & Process Observation
             observation_msg = get_observation()
@@ -263,10 +288,12 @@ class RunACT(Policy):
             raw_action_tensor = (normalized_action * self.action_std) + self.action_mean
 
             # 4. Extract and Command
-            # raw_action_tensor is [1, 7], taking [0] gives vector of 7
             action = raw_action_tensor[0].cpu().numpy()
 
-            self.get_logger().info(f"Action: {action}")
+            if iteration % 30 == 0:
+                self.get_logger().info(f"Iteration {iteration} | SimTime: {(self.get_clock().now() - start_time).nanoseconds / 1e9:.2f}s | Unnormalized Act: {action[:3]}")
+
+            iteration += 1
 
             twist = Twist(
                 linear=Vector3(
@@ -278,16 +305,12 @@ class RunACT(Policy):
             )
             motion_update = self.set_cartesian_twist_target(twist)
             move_robot(motion_update=motion_update)
+
             send_feedback("in progress...")
 
-            # Maintain control rate — MUST match the training dataset's FPS
-            # (30 Hz = 0.033s). The original 4 Hz (0.25s) caused each velocity
-            # command to execute 7.5× longer than intended, producing massive
-            # overshoot on every movement.
-            elapsed = time.time() - loop_start
-            time.sleep(max(0, 0.033 - elapsed))
+            rate.sleep()
 
-        self.get_logger().info("RunACT.insert_cable() exiting...")
+        self.get_logger().info("RunACT.insert_cable() done.")
         return True
 
     def set_cartesian_twist_target(self, twist: Twist, frame_id: str = "base_link"):
