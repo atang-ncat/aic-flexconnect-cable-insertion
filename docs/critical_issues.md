@@ -97,13 +97,23 @@ This is the reference index of every meaningful problem identified in our SFP/SC
 
 ---
 
-## 9. Automated CheatCode dataset is nearly empty `MINOR (deprioritized)`
+## 9. Automated CheatCode dataset is nearly empty (and the script had real bugs) `MAJOR`
 
-**What's wrong.** `auto_collect.py` is fully written and works for SFP. But only 12 SFP episodes have been collected (vs. planned 50–100). The team chose to focus on human teleop instead.
+**What's wrong.** `auto_collect.py` produced only 12 SFP + 5 SC-diag episodes before stalling. On inspection the script had several silent failure modes: wall-clock `time.sleep(1/fps)` on a sim-time node (frame-rate drift), image decoding that assumed naked RGB bytes regardless of `msg.encoding` (would silently write BGR as RGB on Gazebo configs that publish bgr8), recording zero-action frames on transient TF failures (pollutes training distribution), zero-pixel frames when a camera stalled (silent dataset corruption), and 26-D state output incompatible with the new F/T-enabled teleop schema.
 
-**Why it matters.** CheatCode produces smooth proportional-controller velocities (0.01–0.03 m/s) that are 3–10× finer than keyboard. Even with the keyboard now EMA-smoothed, CheatCode demos would be cleaner and cover more board poses.
+**Why it matters.** CheatCode demos are smooth proportional-controller output — strictly cleaner than keyboard even with EMA. More demos per operator-hour, diverse board poses. But only if the script actually produces valid data.
 
-**Status.** Deprioritized per current focus on teleop. Revisit after the F/T-enabled teleop dataset is collected and v10 is trained.
+**Status.** **FIXED.** `auto_collect.py` rewrite:
+- Sim-time control loop (`create_rate` + `rate.sleep`) — frame rate locks to `--fps` regardless of Gazebo speed.
+- Encoding-aware image decoding (rgb8/bgr8/rgba8/bgra8 via `msg.encoding`).
+- 32-D state with tared wrench, matching the new teleop schema.
+- Transient TF failures hold last-action instead of recording a zero frame.
+- Camera stalls drop the frame instead of writing black pixels.
+- New `--plug-type {sfp,sc}` selects gains + frames + task string per profile.
+- New `--dry-run` runs one episode without writing a dataset — catches bringup/TF/camera/F/T problems in 30 s before committing to a long session.
+- Pre-flight F/T publishing + tare sanity checks at startup with actionable error messages.
+
+See `docs/auto_collection_guide.md` for updated commands.
 
 ---
 

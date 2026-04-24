@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Automated demo collection using CheatCode-style ground-truth targeting
-with velocity commands compatible with the LeRobot training pipeline.
+Automated SFP/SC demo collection using CheatCode-style ground-truth
+targeting with velocity commands compatible with the LeRobot training
+pipeline.
 
 Architecture:
     - Uses the same MotionUpdate/velocity interface as lerobot-record
@@ -10,15 +11,36 @@ Architecture:
     - Records directly into LeRobot dataset format via LeRobotDataset API
     - Filters episodes by /scoring/insertion_event success
     - Monitors force and collisions to discard bad episodes
+    - Records F/T (tared) as 6 extra columns in observation.state, so the
+      output dataset is schema-compatible with post-2026-04-24 teleop data
+    - Sim-time control loop (create_rate + rate.sleep) so dataset frame
+      rate stays locked to ``fps`` regardless of Gazebo's wall-clock speed
+    - Encoding-aware image decoding (rgb8 / bgr8 / rgba8 / bgra8)
+    - No zero-action frames on transient TF failures (holds last command
+      instead) and no zero-frame frames on camera stalls (drops the tick)
 
 Usage (inside distrobox, with Gazebo + ground_truth:=true running):
+
+    # Smoke test first — runs one episode without creating a dataset:
     cd /run/host/scratch2/atang/ws_aic/src/aic
     pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
-        --dataset-root /run/host/scratch2/atang/ws_aic/teleop-dataset/sfp_auto \
-        --repo-id atang/aic_sfp_auto \
-        --num-episodes 20
+        --plug-type sfp --dry-run
 
-The dataset it produces can be merged with teleop data for training.
+    # Real collection:
+    pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
+        --plug-type sfp \
+        --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset-ft/sfp \
+        --num-episodes 30
+
+    # SC collection uses a different plug profile (lower gains, slower descent):
+    pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py \
+        --plug-type sc \
+        --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset-ft/sc \
+        --num-episodes 30
+
+The dataset it produces has 32-D observation.state (same as the F/T-
+enabled teleop driver), so auto-collected and teleop demos can be
+trained on together.
 """
 
 import argparse
@@ -35,6 +57,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.time import Time
+from rclpy.duration import Duration
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -130,7 +154,7 @@ FORCE_ABORT = 30.0       # N — abort episode immediately
 class AutoCollectNode(Node):
     def __init__(self):
         super().__init__("auto_collect_node", parameter_overrides=[
-            rclpy.Parameter("use_sim_time", rclpy.Parameter.Type.BOOL, True),
+            Parameter("use_sim_time", Parameter.Type.BOOL, True),
         ])
 
         self.tf_buffer = Buffer()
@@ -138,16 +162,21 @@ class AutoCollectNode(Node):
 
         self.last_controller_state = None
         self.last_joint_states = None
+        self.last_wrench = None          # WrenchStamped — for observation.state
         self.insertion_detected = Event()
         self.collision_detected = Event()
 
-        # Force monitoring state
+        # Force monitoring state.  _tare_force/_tare_torque are the tare
+        # offset from the controller; _current_wrench is the TARED wrench
+        # used both for safety aborts and for the observation.state record.
         self._force_lock = Lock()
         self._tare_force = np.zeros(3)
+        self._tare_torque = np.zeros(3)
         self._current_force_mag = 0.0
         self._max_force_mag = 0.0
         self._time_above_threshold = 0.0
         self._last_wrench_time = None
+        self._current_wrench_tared = np.zeros(6)   # [fx, fy, fz, tx, ty, tz]
 
         self.create_subscription(
             ControllerState,
@@ -180,9 +209,11 @@ class AutoCollectNode(Node):
 
     def _controller_state_cb(self, msg):
         self.last_controller_state = msg
-        tare = msg.fts_tare_offset.wrench.force
+        tare_f = msg.fts_tare_offset.wrench.force
+        tare_t = msg.fts_tare_offset.wrench.torque
         with self._force_lock:
-            self._tare_force = np.array([tare.x, tare.y, tare.z])
+            self._tare_force = np.array([tare_f.x, tare_f.y, tare_f.z])
+            self._tare_torque = np.array([tare_t.x, tare_t.y, tare_t.z])
 
     def _joint_states_cb(self, msg):
         self.last_joint_states = msg
@@ -197,10 +228,14 @@ class AutoCollectNode(Node):
             self.collision_detected.set()
 
     def _wrench_cb(self, msg):
-        raw = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z])
+        self.last_wrench = msg
+        raw_f = np.array([msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z])
+        raw_t = np.array([msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z])
         with self._force_lock:
-            tared = raw - self._tare_force
-            mag = float(np.linalg.norm(tared))
+            tared_f = raw_f - self._tare_force
+            tared_t = raw_t - self._tare_torque
+            self._current_wrench_tared = np.concatenate([tared_f, tared_t])
+            mag = float(np.linalg.norm(tared_f))
             self._current_force_mag = mag
             if mag > self._max_force_mag:
                 self._max_force_mag = mag
@@ -208,6 +243,11 @@ class AutoCollectNode(Node):
             if self._last_wrench_time is not None and mag > FORCE_THRESHOLD:
                 self._time_above_threshold += now - self._last_wrench_time
             self._last_wrench_time = now
+
+    def get_tared_wrench(self) -> np.ndarray:
+        """Return the latest tared wrench (6-D: force xyz, torque xyz)."""
+        with self._force_lock:
+            return self._current_wrench_tared.copy()
 
     def reset_episode_monitors(self):
         """Reset per-episode monitoring state."""
@@ -218,6 +258,8 @@ class AutoCollectNode(Node):
             self._max_force_mag = 0.0
             self._time_above_threshold = 0.0
             self._last_wrench_time = None
+            # Do NOT reset _current_wrench_tared or _tare_force/_tare_torque;
+            # those are maintained by the callbacks across episodes.
 
     def get_force_stats(self):
         with self._force_lock:
@@ -231,11 +273,26 @@ class AutoCollectNode(Node):
         with self._force_lock:
             return self._current_force_mag > FORCE_ABORT
 
-    def wait_for_state(self, timeout=10.0):
+    def wait_for_state(self, timeout=10.0, require_wrench=True):
+        """Block until all required ROS state has arrived.
+
+        Gating on wrench matters because the first few ticks of every
+        recorded episode would otherwise carry zero F/T, which leaks a
+        dead signal into the training distribution.
+        """
         t0 = time.monotonic()
-        while self.last_controller_state is None or self.last_joint_states is None:
+        while True:
+            missing = []
+            if self.last_controller_state is None:
+                missing.append("controller_state")
+            if self.last_joint_states is None:
+                missing.append("joint_states")
+            if require_wrench and self.last_wrench is None:
+                missing.append("fts_broadcaster/wrench")
+            if not missing:
+                return
             if time.monotonic() - t0 > timeout:
-                raise TimeoutError("Timed out waiting for controller_state / joint_states")
+                raise TimeoutError(f"Timed out waiting for: {missing}")
             time.sleep(0.1)
 
     def lookup_tf(self, target, source):
@@ -271,12 +328,20 @@ class AutoCollectNode(Node):
         )
 
     def get_observation_dict(self):
-        """Build observation dict matching AICRobotAICController format."""
+        """Build observation dict matching AICRobotAICController (32-D).
+
+        Layout mirrors the teleop driver exactly after the 2026-04-24 F/T
+        update: 26 legacy fields + 6 wrench fields (force xyz + torque xyz),
+        all with the controller's tare subtracted.  This keeps
+        auto-collected demos schema-compatible with F/T-enabled teleop
+        data so they can be trained on together.
+        """
         cs = self.last_controller_state
         js = self.last_joint_states
         p = cs.tcp_pose
         v = cs.tcp_velocity
         e = cs.tcp_error
+        w = self.get_tared_wrench()
         return {
             "tcp_pose.position.x": p.position.x,
             "tcp_pose.position.y": p.position.y,
@@ -304,6 +369,12 @@ class AutoCollectNode(Node):
             "joint_positions.4": js.position[4],
             "joint_positions.5": js.position[5],
             "joint_positions.6": js.position[6],
+            "wrench.force.x": float(w[0]),
+            "wrench.force.y": float(w[1]),
+            "wrench.force.z": float(w[2]),
+            "wrench.torque.x": float(w[3]),
+            "wrench.torque.y": float(w[4]),
+            "wrench.torque.z": float(w[5]),
         }
 
 
@@ -312,10 +383,30 @@ class AutoCollectNode(Node):
 # ---------------------------------------------------------------------------
 
 class CameraCapture:
-    """Subscribes to ROS image topics and captures the latest frame."""
-    def __init__(self, node, cameras, scale=0.25):
+    """Subscribes to ROS image topics and caches the latest frame per camera.
+
+    Image handling is encoding-aware: Gazebo typically publishes ``rgb8``,
+    ``bgr8``, or ``rgba8`` depending on sensor config.  We detect via
+    ``msg.encoding`` and convert to a canonical ``rgb8`` (H, W, 3) uint8
+    layout — same as what the lerobot driver records — so auto-collected
+    frames match teleop frames pixel-for-pixel through the training
+    pipeline.  Silently assuming bytes-as-RGB (previous behavior) would
+    produce a BGR-trained policy that fails at eval time.
+    """
+
+    _SUPPORTED = {
+        # encoding -> (channels, swap_rb_to_rgb)
+        "rgb8": (3, False),
+        "bgr8": (3, True),
+        "rgba8": (4, False),
+        "bgra8": (4, True),
+    }
+
+    def __init__(self, node, cameras, scale=0.25, out_hw=(256, 288)):
         self.frames = {}
         self.scale = scale
+        self.out_hw = out_hw
+        self._warned_encodings = set()
         for name, topic in cameras.items():
             self.frames[name] = None
             node.create_subscription(
@@ -324,17 +415,45 @@ class CameraCapture:
                 qos_profile_sensor_data,
             )
 
-    def _img_cb(self, name, msg):
-        arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
-        if arr.shape[2] == 4:
+    def _decode(self, msg):
+        enc = msg.encoding
+        if enc not in self._SUPPORTED:
+            if enc not in self._warned_encodings:
+                logger.warning(f"Unexpected image encoding '{enc}'; treating as rgb8 bytes. "
+                               f"If colors look wrong, add this encoding to CameraCapture._SUPPORTED.")
+                self._warned_encodings.add(enc)
+            channels, swap_rb = 3, False
+        else:
+            channels, swap_rb = self._SUPPORTED[enc]
+        # Use step for correct stride handling instead of assuming
+        # packed rows (Gazebo does pack, but robustness is free).
+        expected_size = msg.height * msg.step
+        data = np.frombuffer(msg.data, dtype=np.uint8, count=expected_size)
+        arr = data.reshape(msg.height, msg.step // channels, channels)[:, :msg.width, :]
+        if channels == 4:
             arr = arr[:, :, :3]
-        if self.scale != 1.0:
-            arr = cv2.resize(arr, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
-        self.frames[name] = arr
+        if swap_rb:
+            arr = arr[:, :, ::-1]
+        return np.ascontiguousarray(arr)
+
+    def _img_cb(self, name, msg):
+        try:
+            arr = self._decode(msg)
+            if self.scale != 1.0:
+                arr = cv2.resize(arr, None, fx=self.scale, fy=self.scale,
+                                 interpolation=cv2.INTER_AREA)
+            self.frames[name] = arr
+        except Exception as e:
+            logger.error(f"Image decode failed for {name} (encoding={msg.encoding}): {e}")
 
     def get_images(self):
-        return {k: (v.copy() if v is not None else np.zeros((256, 288, 3), dtype=np.uint8))
-                for k, v in self.frames.items()}
+        """Return the latest frames.  Raises if any camera has no data —
+        the old fallback of substituting zeros was silently polluting the
+        dataset with black frames when a camera topic stalled."""
+        missing = [k for k, v in self.frames.items() if v is None]
+        if missing:
+            raise RuntimeError(f"No image received yet from cameras: {missing}")
+        return {k: v.copy() for k, v in self.frames.items()}
 
     def wait_for_images(self, timeout=10.0):
         t0 = time.monotonic()
@@ -461,8 +580,12 @@ def create_or_resume_dataset(repo_id, root, fps=30, resume=False, vcodec="libsvt
     cam_shape = [256, 288, 3]
     features = {
         "observation.state": {
+            # 32-D: 26 legacy fields + 6 tared wrench fields.  This layout
+            # mirrors the AICRobotAICController ObservationState (post-
+            # 2026-04-24 F/T fix) so auto-collected and teleop datasets
+            # have identical schemas and can be trained on together.
             "dtype": "float32",
-            "shape": [26],
+            "shape": [32],
             "names": [
                 "tcp_pose.position.x", "tcp_pose.position.y", "tcp_pose.position.z",
                 "tcp_pose.orientation.x", "tcp_pose.orientation.y",
@@ -474,6 +597,8 @@ def create_or_resume_dataset(repo_id, root, fps=30, resume=False, vcodec="libsvt
                 "joint_positions.0", "joint_positions.1", "joint_positions.2",
                 "joint_positions.3", "joint_positions.4", "joint_positions.5",
                 "joint_positions.6",
+                "wrench.force.x", "wrench.force.y", "wrench.force.z",
+                "wrench.torque.x", "wrench.torque.y", "wrench.torque.z",
             ],
         },
         "action": {
@@ -528,11 +653,38 @@ def build_frame(obs_dict, action_dict, images, dataset_features, task_str):
 # Insertion episode logic
 # ---------------------------------------------------------------------------
 
-TASK_STR = "Insert SFP connector into SFP port on NIC card"
+# Per-plug defaults.  Selected by --plug-type; override any individual
+# field via --port-frame / --plug-frame / --task.
+PLUG_PROFILES = {
+    "sfp": {
+        "task": "insert SFP",
+        # NIC card hosts the SFP port; default layout is slot 0, mount 0.
+        "port_frame": "task_board/nic_card_mount_0/sfp_port_0_link",
+        "plug_frame": "cable_0/sfp_tip_link",
+        # SFP guide rails absorb small overshoots — moderately fast is fine.
+        "approach_max_v": 0.04,
+        "align_max_v": 0.02,
+        "insert_max_v": 0.010,
+        "insert_kp": 2.0,
+    },
+    "sc": {
+        "task": "insert SC",
+        "port_frame": "task_board/sc_port_0/sc_port_base_link",
+        "plug_frame": "cable_0/sc_tip_link",
+        # SC has no guide rails; the exact failure mode documented in
+        # docs/sc_insertion_problem.md is oscillation under too-high kp.
+        # Back off the proportional gain and crawl the descent.
+        "approach_max_v": 0.03,
+        "align_max_v": 0.012,
+        "insert_max_v": 0.004,
+        "insert_kp": 1.2,
+    },
+}
 
-# Correct TF frame names (verified against NIC Card Mount model.sdf and spawn_cable.launch.py)
-DEFAULT_PORT_FRAME = "task_board/nic_card_mount_0/sfp_port_0_link"
-DEFAULT_PLUG_FRAME = "cable_0/sfp_tip_link"
+# Backwards-compat exports (old imports referenced these by name).
+TASK_STR = PLUG_PROFILES["sfp"]["task"]
+DEFAULT_PORT_FRAME = PLUG_PROFILES["sfp"]["port_frame"]
+DEFAULT_PLUG_FRAME = PLUG_PROFILES["sfp"]["plug_frame"]
 
 
 @dataclass
@@ -546,35 +698,57 @@ class EpisodeResult:
     duration: float = 0.0
 
 
-def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
+def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0,
+                profile=None):
     """Execute one insertion episode with full safety monitoring."""
     node.reset_episode_monitors()
     result = EpisodeResult()
-    t0 = time.monotonic()
+
+    # Use sim time exclusively for the control loop: ``node`` has
+    # use_sim_time=True, so self.get_clock() advances with Gazebo.  Wall
+    # time (time.monotonic) would drift relative to the 30 Hz dataset
+    # frame rate whenever Gazebo runs faster or slower than real time.
+    t_sim_start = node.get_clock().now()
     last_pos = None
     stuck_counter = 0
+    last_action = dict(ZERO_ACTION)
 
     def step(action_dict):
-        """Record one frame and send velocity command."""
+        """Record one frame and send velocity command.
+
+        Returns False if the frame could not be recorded (e.g. a camera
+        stall); the caller drops the step so we never write a corrupted
+        frame into the dataset.
+        """
+        try:
+            images = cameras.get_images()
+        except RuntimeError as e:
+            logger.warning(f"    skipping frame: {e}")
+            return False
         obs_dict = node.get_observation_dict()
-        images = cameras.get_images()
         result.frames.append((obs_dict, action_dict, images))
         node.send_velocity(
             [action_dict["linear.x"], action_dict["linear.y"], action_dict["linear.z"]],
             [action_dict["angular.x"], action_dict["angular.y"], action_dict["angular.z"]],
         )
+        return True
+
+    def elapsed_sim() -> float:
+        return (node.get_clock().now() - t_sim_start).nanoseconds / 1e9
 
     def check_abort():
         """Check all abort conditions. Returns reason string or None."""
         nonlocal last_pos, stuck_counter
-        if time.monotonic() - t0 > max_time:
+        if elapsed_sim() > max_time:
             return "timeout"
         if node.collision_detected.is_set():
             return "off-limit collision"
         if node.is_force_abort():
             return f"force too high ({node.get_force_stats()['current']:.1f}N > {FORCE_ABORT}N)"
 
-        # Stuck detection: if TCP hasn't moved >0.5mm in 2 seconds
+        # Stuck detection: if TCP hasn't moved >0.5mm across ~2s of sim
+        # time (measured in control ticks since the outer loop runs at
+        # ``fps``).  Resets on any motion above the threshold.
         cur_pos, _ = node.get_tcp_pose()
         if last_pos is not None:
             if np.linalg.norm(cur_pos - last_pos) < 0.0005:
@@ -586,8 +760,15 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         last_pos = cur_pos.copy()
         return None
 
+    # Sim-time rate: ticks at ``fps`` using the Gazebo clock, not wall
+    # clock.  create_rate() must be called inside the node's executor
+    # context; since the node is being spun on a background thread,
+    # rate.sleep() will block until the next sim tick arrives.
+    rate = node.create_rate(fps)
+
     def run_phase(name, z_start, z_end, gains, max_steps, is_insertion=False):
         """Run a control phase. Returns True if should continue, False if aborted/done."""
+        nonlocal last_action
         logger.info(f"  Phase: {name}")
         if z_start == z_end:
             z_values = [z_start] * max_steps
@@ -605,12 +786,16 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                 return False
 
             try:
-                target_pos, target_quat = compute_target_pose(node, port_frame, plug_frame, z_offset=z)
+                target_pos, target_quat = compute_target_pose(
+                    node, port_frame, plug_frame, z_offset=z
+                )
                 cur_pos, cur_quat = node.get_tcp_pose()
                 action, dist = compute_velocity_action(
-                    cur_pos, cur_quat, target_pos, target_quat, gains, insertion_phase=is_insertion
+                    cur_pos, cur_quat, target_pos, target_quat, gains,
+                    insertion_phase=is_insertion,
                 )
-                step(action)
+                if step(action):
+                    last_action = action
 
                 # Log force periodically during insertion phase
                 if is_insertion and i % (fps * 2) == 0:
@@ -624,35 +809,56 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
                     break
 
             except TransformException as e:
-                logger.warning(f"    TF failed: {e}")
-                step(ZERO_ACTION)
+                # Do NOT record a frame with zero action on transient TF
+                # failure — that pollutes the training distribution with
+                # 'held still' frames in the middle of active motion.
+                # Keep publishing the last valid velocity so the robot
+                # holds course and wait for TF to recover.
+                logger.warning(f"    TF failed, holding last action: {e}")
+                node.send_velocity(
+                    [last_action["linear.x"], last_action["linear.y"], last_action["linear.z"]],
+                    [last_action["angular.x"], last_action["angular.y"], last_action["angular.z"]],
+                )
 
-            time.sleep(1.0 / fps)
+            rate.sleep()
         return True
 
+    # Per-plug gain schedule (see PLUG_PROFILES).  SFP uses the original
+    # tuning that historically works; SC uses lower kp and slower descent
+    # because the SC port has no guide rails to absorb overshoot.
+    prof = profile or PLUG_PROFILES["sfp"]
+
     # Phase 1: Approach — move above port
-    approach_gains = ControllerGains(kp_linear=1.5, max_linear_vel=0.04, kp_angular=2.0, max_angular_vel=0.3)
+    approach_gains = ControllerGains(
+        kp_linear=1.5, max_linear_vel=prof["approach_max_v"],
+        kp_angular=2.0, max_angular_vel=0.3,
+    )
     if not run_phase("Approach", z_start=0.12, z_end=0.12, gains=approach_gains, max_steps=fps * 8):
         node.stop_robot()
-        result.duration = time.monotonic() - t0
+        result.duration = elapsed_sim()
         return result
 
     # Phase 2: Fine alignment — lower and correct
-    fine_gains = ControllerGains(kp_linear=2.0, max_linear_vel=0.02, kp_angular=2.5, max_angular_vel=0.2)
+    fine_gains = ControllerGains(
+        kp_linear=2.0, max_linear_vel=prof["align_max_v"],
+        kp_angular=2.5, max_angular_vel=0.2,
+    )
     if not run_phase("Fine align", z_start=0.06, z_end=0.06, gains=fine_gains, max_steps=fps * 4):
         node.stop_robot()
-        result.duration = time.monotonic() - t0
+        result.duration = elapsed_sim()
         return result
 
     # Phase 3: Insertion descent — slow and force-aware
     insert_gains = ControllerGains(
-        kp_linear=2.0, max_linear_vel=0.01, insertion_linear_vel=0.008,
+        kp_linear=prof["insert_kp"],
+        max_linear_vel=prof["insert_max_v"],
+        insertion_linear_vel=prof["insert_max_v"] * 0.8,
         kp_angular=2.5, max_angular_vel=0.15,
     )
     if not run_phase("Insertion", z_start=0.06, z_end=-0.015, gains=insert_gains,
                      max_steps=fps * 12, is_insertion=True):
         node.stop_robot()
-        result.duration = time.monotonic() - t0
+        result.duration = elapsed_sim()
         return result
 
     # Phase 4: Hold — wait for insertion event
@@ -661,7 +867,7 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
         if node.insertion_detected.is_set():
             break
         step(ZERO_ACTION)
-        time.sleep(1.0 / fps)
+        rate.sleep()
 
     node.stop_robot()
 
@@ -670,7 +876,7 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
     fs = node.get_force_stats()
     result.max_force = fs["max"]
     result.time_above_force_threshold = fs["time_above_threshold"]
-    result.duration = time.monotonic() - t0
+    result.duration = elapsed_sim()
 
     return result
 
@@ -680,22 +886,44 @@ def run_episode(node, cameras, port_frame, plug_frame, fps=30, max_time=60.0):
 # ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Automated SFP demo collection")
-    ap.add_argument("--dataset-root", required=True, help="Full path for the dataset")
-    ap.add_argument("--repo-id", default="atang/aic_sfp_auto")
+    ap = argparse.ArgumentParser(description="Automated SFP/SC demo collection")
+    ap.add_argument("--dataset-root", required=False,
+                    help="Full path for the dataset (omit with --dry-run).")
+    ap.add_argument("--repo-id", default=None,
+                    help="Lerobot repo_id; defaults to local/aic_<plug>_auto.")
     ap.add_argument("--num-episodes", type=int, default=20, help="Target successful episodes")
     ap.add_argument("--max-attempts", type=int, default=50, help="Max total attempts")
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--port-frame", default=DEFAULT_PORT_FRAME,
-                    help="TF frame for the target port (default: nic_card_mount_0/sfp_port_0)")
-    ap.add_argument("--plug-frame", default=DEFAULT_PLUG_FRAME,
-                    help="TF frame for the cable plug tip (default: cable_0/sfp_tip)")
+    ap.add_argument("--plug-type", choices=list(PLUG_PROFILES.keys()), default="sfp",
+                    help="Which plug profile to target; selects default frames, task "
+                         "string, and per-phase gains.  Override individual fields with "
+                         "--port-frame / --plug-frame / --task.")
+    ap.add_argument("--port-frame", default=None,
+                    help="Override TF frame for target port (default: plug profile)")
+    ap.add_argument("--plug-frame", default=None,
+                    help="Override TF frame for cable plug tip (default: plug profile)")
+    ap.add_argument("--task", default=None,
+                    help="Override task string (default: plug profile)")
     ap.add_argument("--resume", action="store_true", help="Resume existing dataset")
     ap.add_argument("--vcodec", default="libsvtav1")
     ap.add_argument("--max-episode-time", type=float, default=60.0, help="Max seconds per attempt")
     ap.add_argument("--discard-high-force", action="store_true",
                     help="Discard episodes where force exceeded scoring threshold for >1s")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Run one full episode without creating a dataset.  Useful "
+                         "for verifying Gazebo + TF + cameras + F/T are all working "
+                         "before committing to a long session.")
     args = ap.parse_args()
+
+    # Resolve plug-profile-driven defaults (allowing CLI overrides).
+    profile = dict(PLUG_PROFILES[args.plug_type])
+    port_frame = args.port_frame or profile["port_frame"]
+    plug_frame = args.plug_frame or profile["plug_frame"]
+    task_str   = args.task       or profile["task"]
+    repo_id    = args.repo_id    or f"local/aic_{args.plug_type}_auto"
+
+    if not args.dry_run and not args.dataset_root:
+        ap.error("--dataset-root is required unless --dry-run is set")
 
     rclpy.init()
     node = AutoCollectNode()
@@ -712,16 +940,42 @@ def main():
         "right_camera": "/right_camera/image",
     }, scale=0.25)
 
-    logger.info("Waiting for robot state and cameras...")
-    node.wait_for_state()
-    cameras.wait_for_images(timeout=15.0)
+    # --- Pre-flight checks (fail fast with actionable diagnostics) --------
+    logger.info(f"Plug profile: {args.plug_type}  |  Task: {task_str!r}")
+    logger.info(f"Port frame: {port_frame}")
+    logger.info(f"Plug frame: {plug_frame}")
+    logger.info(f"Dataset: {'<DRY-RUN>' if args.dry_run else args.dataset_root} (repo_id={repo_id})")
+
+    logger.info("Waiting for controller_state + joint_states + wrench ...")
+    try:
+        node.wait_for_state(timeout=15.0, require_wrench=True)
+    except TimeoutError as e:
+        logger.error(
+            f"{e}\n"
+            "Hint: is Gazebo running with ground_truth:=true and the "
+            "aic_controller active?  The wrench topic is specifically "
+            "/fts_broadcaster/wrench — if that's missing, the F/T "
+            "sensor bringup failed."
+        )
+        rclpy.shutdown()
+        return
+
+    logger.info("Waiting for cameras ...")
+    if not cameras.wait_for_images(timeout=15.0):
+        logger.error(
+            "No frames from one or more cameras after 15s.  Expected topics:\n"
+            "  /left_camera/image, /center_camera/image, /right_camera/image\n"
+            "Check with: ros2 topic hz /left_camera/image"
+        )
+        rclpy.shutdown()
+        return
 
     logger.info("Waiting for TF frames...")
     tf_ok = False
     for _ in range(100):
         try:
-            node.lookup_tf("base_link", args.port_frame)
-            node.lookup_tf("base_link", args.plug_frame)
+            node.lookup_tf("base_link", port_frame)
+            node.lookup_tf("base_link", plug_frame)
             node.lookup_tf("base_link", "gripper/tcp")
             tf_ok = True
             break
@@ -729,17 +983,49 @@ def main():
             time.sleep(0.2)
     if not tf_ok:
         logger.error(f"TF frames not found. Tried:\n"
-                     f"  port: {args.port_frame}\n"
-                     f"  plug: {args.plug_frame}\n"
+                     f"  port: {port_frame}\n"
+                     f"  plug: {plug_frame}\n"
                      f"  gripper: gripper/tcp\n"
-                     f"Is ground_truth:=true set? Is the scene spawned?")
+                     f"Is ground_truth:=true set? Is the scene spawned with "
+                     f"the appropriate rails for --plug-type={args.plug_type}?")
+        rclpy.shutdown()
+        return
+    logger.info("TF ready.")
+
+    # Confirm we're actually receiving wrench updates (tared).  If tare is
+    # still zeros at this point, either the controller didn't tare or we
+    # grabbed the snapshot too early.
+    w = node.get_tared_wrench()
+    logger.info(f"Initial tared wrench: force={w[:3].round(3).tolist()}  "
+                f"torque={w[3:].round(3).tolist()}")
+    if np.allclose(w, 0, atol=1e-6) and np.allclose(node._tare_force, 0, atol=1e-6):
+        logger.warning(
+            "Tare offset is zero — the controller may not have tared yet. "
+            "Consider relaunching Gazebo and waiting a few seconds before retrying."
+        )
+
+    if args.dry_run:
+        logger.info("=== DRY RUN: executing one episode without saving ===")
+        ep = run_episode(
+            node, cameras,
+            port_frame=port_frame, plug_frame=plug_frame,
+            fps=args.fps, max_time=args.max_episode_time,
+            profile=profile,
+        )
+        node.stop_robot()
+        logger.info(f"\nDry-run result: success={ep.success}  aborted={ep.aborted} "
+                    f"({ep.abort_reason!r})  frames={len(ep.frames)}  "
+                    f"max_force={ep.max_force:.1f}N  duration={ep.duration:.1f}s")
+        if ep.frames:
+            obs = ep.frames[-1][0]
+            w_keys = [k for k in obs if k.startswith("wrench")]
+            logger.info(f"Sample final-frame wrench channels: "
+                        f"{ {k: round(obs[k], 3) for k in w_keys} }")
         rclpy.shutdown()
         return
 
-    logger.info(f"TF ready. Port: {args.port_frame} | Plug: {args.plug_frame}")
-
     dataset = create_or_resume_dataset(
-        args.repo_id, args.dataset_root, args.fps, args.resume, args.vcodec
+        repo_id, args.dataset_root, args.fps, args.resume, args.vcodec
     )
 
     successes = 0
@@ -758,10 +1044,11 @@ def main():
 
             ep = run_episode(
                 node, cameras,
-                port_frame=args.port_frame,
-                plug_frame=args.plug_frame,
+                port_frame=port_frame,
+                plug_frame=plug_frame,
                 fps=args.fps,
                 max_time=args.max_episode_time,
+                profile=profile,
             )
 
             # Decision: save or discard
@@ -796,7 +1083,7 @@ def main():
                             f"duration={ep.duration:.1f}s)")
                 for obs_dict, action_dict, images in ep.frames:
                     frame = build_frame(obs_dict, action_dict, images,
-                                        dataset.meta.features, TASK_STR)
+                                        dataset.meta.features, task_str)
                     dataset.add_frame(frame)
                 dataset.save_episode()
                 successes += 1
@@ -828,7 +1115,7 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
 
-    logger.info(f"Dataset saved at: {args.dataset_root}")
+    logger.info(f"Dataset saved at: {args.dataset_root}  (repo_id={repo_id})")
 
 
 if __name__ == "__main__":
