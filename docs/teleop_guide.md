@@ -4,6 +4,11 @@
 >
 > **Time to competency:** ~30 minutes of practice before recording real demos.
 
+> [!IMPORTANT]
+> **Before your next recording session**, read `teleop_recording_steps.md` — it is the authoritative step-by-step procedure that incorporates the 2026-04-24 driver fixes (F/T sensor recording and EMA action smoothing). This guide focuses on the *technique* of teleoperating (controls, drills, what to keep vs. discard); `teleop_recording_steps.md` covers the *procedure* of setting up a session that produces a correctly-formatted dataset.
+>
+> The critical rule: **do not resume the old `teleop-dataset/` directory with the new driver.** The schemas are incompatible — old data has 26 state columns, new data has 32 (with 6 wrench columns). Use a fresh path like `teleop-dataset-ft-v1`. See `critical_issues.md` for the full background on why.
+
 ---
 
 ## 1. Prerequisites
