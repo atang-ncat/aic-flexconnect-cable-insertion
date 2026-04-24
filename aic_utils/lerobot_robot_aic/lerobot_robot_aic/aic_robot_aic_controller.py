@@ -47,6 +47,7 @@ from rclpy.publisher import Publisher
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.subscription import Subscription
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import WrenchStamped
 
 from .aic_robot import aic_cameras, arm_joint_names
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
@@ -83,6 +84,12 @@ ObservationState = TypedDict(
         "joint_positions.4": float,
         "joint_positions.5": float,
         "joint_positions.6": float,
+        "wrench.force.x": float,
+        "wrench.force.y": float,
+        "wrench.force.z": float,
+        "wrench.torque.x": float,
+        "wrench.torque.y": float,
+        "wrench.torque.z": float,
     },
 )
 
@@ -123,12 +130,14 @@ class AICRos2Interface:
     joint_motion_update_pub: Publisher[JointMotionUpdate]
     controller_state_sub: Subscription[ControllerState]
     joint_states_sub: Subscription[JointState]
+    wrench_sub: Subscription[WrenchStamped]
     logger: RcutilsLogger
 
     @staticmethod
     def connect(
         controller_state_cb: Callable[[ControllerState], None],
         joint_states_cb: Callable[[JointState], None],
+        wrench_cb: Callable[[WrenchStamped], None],
     ) -> "AICRos2Interface":
         if not rclpy.ok():
             rclpy.init()
@@ -163,6 +172,10 @@ class AICRos2Interface:
             JointState, "/joint_states", joint_states_cb, qos_profile_sensor_data
         )
 
+        wrench_sub = node.create_subscription(
+            WrenchStamped, "/fts_broadcaster/wrench", wrench_cb, qos_profile_sensor_data
+        )
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         executor_thread = Thread(target=executor.spin, daemon=True)
@@ -178,6 +191,7 @@ class AICRos2Interface:
             joint_motion_update_pub=joint_motion_update_pub,
             controller_state_sub=controller_state_sub,
             joint_states_sub=joint_states_sub,
+            wrench_sub=wrench_sub,
             logger=logger,
         )
 
@@ -194,6 +208,7 @@ class AICRobotAICController(Robot):
         self.last_joint_states: JointState | None = None
 
         self._is_connected = False
+        self.last_wrench: WrenchStamped | None = None
 
         if config.teleop_frame_id not in ["gripper/tcp", "base_link"]:
             raise ValueError(
@@ -283,8 +298,11 @@ class AICRobotAICController(Robot):
         def joint_states_cb(msg: JointState):
             self.last_joint_states = msg
 
+        def wrench_cb(msg: WrenchStamped):
+            self.last_wrench = msg
+
         self.ros2_interface = AICRos2Interface.connect(
-            controller_state_cb, joint_states_cb
+            controller_state_cb, joint_states_cb, wrench_cb
         )
 
         change_mode_req = (
@@ -334,6 +352,27 @@ class AICRobotAICController(Robot):
         tcp_velocity = self.last_controller_state.tcp_velocity
         tcp_error = self.last_controller_state.tcp_error
         joint_positions = self.last_joint_states.position
+
+        # F/T sensor: tared wrench = raw - controller's fts_tare_offset.
+        # Untared, the wrench is dominated by the gripper+plug gravity load
+        # (5-15 N constant) and the small contact forces (1-3 N) that matter
+        # for insertion learning are buried in the offset.  The controller
+        # publishes its tare on controller_state.fts_tare_offset; subtract
+        # it so what reaches the dataset is real contact signal.
+        if self.last_wrench is not None:
+            _w = self.last_wrench.wrench
+            _t = self.last_controller_state.fts_tare_offset.wrench
+            wrench_vals = (
+                _w.force.x  - _t.force.x,
+                _w.force.y  - _t.force.y,
+                _w.force.z  - _t.force.z,
+                _w.torque.x - _t.torque.x,
+                _w.torque.y - _t.torque.y,
+                _w.torque.z - _t.torque.z,
+            )
+        else:
+            wrench_vals = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
         controller_state_obs: ObservationState = {
             "tcp_pose.position.x": tcp_pose.position.x,
             "tcp_pose.position.y": tcp_pose.position.y,
@@ -361,6 +400,12 @@ class AICRobotAICController(Robot):
             "joint_positions.4": joint_positions[4],
             "joint_positions.5": joint_positions[5],
             "joint_positions.6": joint_positions[6],
+            "wrench.force.x": wrench_vals[0],
+            "wrench.force.y": wrench_vals[1],
+            "wrench.force.z": wrench_vals[2],
+            "wrench.torque.x": wrench_vals[3],
+            "wrench.torque.y": wrench_vals[4],
+            "wrench.torque.z": wrench_vals[5],
         }
 
         # Capture images from cameras
