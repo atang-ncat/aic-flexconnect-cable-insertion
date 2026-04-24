@@ -1,0 +1,213 @@
+# ACT v9 — smoothed actions + F/T sensor + temporal ensemble + smaller chunk
+#
+# What changed from v8
+# --------------------
+# Data:
+#   * dataset.root: teleop-dataset-smoothed
+#     Savitzky-Golay smoothed actions (window=9, polyorder=3).  The keyboard
+#     step-functions become continuous ramps so the policy learns smooth
+#     velocity profiles instead of instantaneous on/off commands.  151
+#     episodes (not 201 -- the +50 episodes from v6 onward were collected
+#     AFTER the smoothing run; add them when you re-run smooth_actions.py on
+#     the full 201-ep dataset).
+#   * wrench fields included in observation.state (6 extra dims: force xyz +
+#     torque xyz).  The lerobot robot driver now subscribes to
+#     /fts_broadcaster/wrench and writes these during recording.  THIS RUN
+#     REQUIRES a dataset re-collected with the updated driver -- see
+#     docs/data_collection_tracker.md.  If running on the old smoothed
+#     dataset (no wrench), set state_keep_names below to the 14-D list
+#     and remove the wrench columns.
+#   * previous_action disabled (teacher-forcing exposure bias outweighs
+#     the signal gain for this run; revisit once we have eval numbers).
+#
+# Policy:
+#   * discrete_action: false -- smoothed actions are continuous; L1
+#     regression is the correct objective.
+#   * use_vae: true (re-enabled) -- the CVAE is beneficial for regression;
+#     kl_weight kept at 10.0.
+#   * chunk_size: 50 (was 100) -- 1.67s horizon.  Paired with temporal
+#     ensemble this gives per-frame re-planning without the 3.33s commitment
+#     that prevented reactive contact correction.
+#   * temporal_ensemble_coeff: 0.01 -- standard ACT value; blends predictions
+#     from the last min(step, chunk_size) overlapping chunks at inference.
+#   * dim_model: 256, n_encoder_layers: 2 (kept from v8; v6b 51.6M params
+#     overfit badly; 15M is better matched to ~120k training frames).
+#
+# Loss:
+#   * action_weighting re-enabled (scale=0.03, floor=0.1) -- smoothed data
+#     still has ~60% near-idle frames; weighting keeps the gradient focused
+#     on motion frames.
+#   * Early stopping on val/l1_loss (minimize) -- motion_accuracy is only
+#     meaningful for discrete heads; L1 is the right proxy for regression.
+#
+# Launch:
+#   IMPORTANT: re-collect the dataset with F/T first, then:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=<GPU> \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v9.yaml
+#
+#   To run without F/T (on existing smoothed dataset, 14-D state):
+#     --set dataset.state_keep_names="[...]"  (see state_keep_names below)
+
+run_name: v9_smooth_ft_ensemble_50chunk
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  # Use Savitzky-Golay smoothed actions.  Requires re-running
+  # smooth_actions.py on the full 201-ep dataset first (currently only
+  # covers the original 151 eps).  Set to teleop-dataset to fall back
+  # to raw keyboard data if needed.
+  root: teleop-dataset-smoothed
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 20
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  # Drop the leaky velocity/error channels.  Keep tcp_pose (7D),
+  # joint_positions (7D), and wrench (6D) = 20D clean state.
+  # If running on old dataset without wrench, switch to state_keep_names
+  # listing only the 14 tcp_pose + joint columns.
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  # Uncomment and use this instead of state_drop_prefixes when running
+  # on old datasets that do NOT have wrench columns:
+  # state_keep_names:
+  #   - tcp_pose.position.x
+  #   - tcp_pose.position.y
+  #   - tcp_pose.position.z
+  #   - tcp_pose.orientation.x
+  #   - tcp_pose.orientation.y
+  #   - tcp_pose.orientation.z
+  #   - tcp_pose.orientation.w
+  #   - joint_positions.0
+  #   - joint_positions.1
+  #   - joint_positions.2
+  #   - joint_positions.3
+  #   - joint_positions.4
+  #   - joint_positions.5
+  #   - joint_positions.6
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 80_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# Re-enabled: smoothed data still has ~60% near-idle frames.
+action_weighting:
+  enable: true
+  scale: 0.03
+  floor: 0.1
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 10_000
+  min_delta: 0.0002
+  min_steps: 15_000
+
+evaluation:
+  eval_freq: 2_000
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v9", "3cam", "smoothed", "ft-sensor", "temporal-ensemble", "chunk50", "regression", "vae"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 50
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  # CVAE back on for regression objective.
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  # Temporal ensemble: blend predictions from overlapping past chunks at
+  # inference. coeff=0.01 is the ACT paper default. Higher = weight older
+  # chunks more; lower = weight most-recent more. 0.01 is a good starting
+  # point for 30Hz with chunk_size=50.
+  temporal_ensemble_coeff: 0.01
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: MEAN_STD
