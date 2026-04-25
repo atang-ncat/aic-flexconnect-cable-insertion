@@ -84,6 +84,13 @@ ObservationState = TypedDict(
         "joint_positions.4": float,
         "joint_positions.5": float,
         "joint_positions.6": float,
+        "joint_velocities.0": float,
+        "joint_velocities.1": float,
+        "joint_velocities.2": float,
+        "joint_velocities.3": float,
+        "joint_velocities.4": float,
+        "joint_velocities.5": float,
+        "joint_velocities.6": float,
         "wrench.force.x": float,
         "wrench.force.y": float,
         "wrench.force.z": float,
@@ -352,6 +359,17 @@ class AICRobotAICController(Robot):
         tcp_velocity = self.last_controller_state.tcp_velocity
         tcp_error = self.last_controller_state.tcp_error
         joint_positions = self.last_joint_states.position
+        # Joint velocities are already published on /joint_states alongside
+        # positions -- no extra subscription needed.  ACT/Diffusion-Policy
+        # baselines benefit from explicit dynamics signals; without this
+        # the policy has to infer joint velocity from the image stream
+        # alone.  Falls back to zeros if the upstream message omits the
+        # field (some bridges publish position-only).
+        joint_velocities = (
+            self.last_joint_states.velocity
+            if len(self.last_joint_states.velocity) >= 7
+            else (0.0,) * 7
+        )
 
         # F/T sensor: tared wrench = raw - controller's fts_tare_offset.
         # Untared, the wrench is dominated by the gripper+plug gravity load
@@ -400,6 +418,13 @@ class AICRobotAICController(Robot):
             "joint_positions.4": joint_positions[4],
             "joint_positions.5": joint_positions[5],
             "joint_positions.6": joint_positions[6],
+            "joint_velocities.0": joint_velocities[0],
+            "joint_velocities.1": joint_velocities[1],
+            "joint_velocities.2": joint_velocities[2],
+            "joint_velocities.3": joint_velocities[3],
+            "joint_velocities.4": joint_velocities[4],
+            "joint_velocities.5": joint_velocities[5],
+            "joint_velocities.6": joint_velocities[6],
             "wrench.force.x": wrench_vals[0],
             "wrench.force.y": wrench_vals[1],
             "wrench.force.z": wrench_vals[2],
