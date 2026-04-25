@@ -33,6 +33,38 @@ from rclpy.executors import SingleThreadedExecutor
 from .aic_robot import arm_joint_names
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
 
+# EMA smoothing on the published action.  Each get_action() tick the
+# emitted value moves a fraction ``ACTION_SMOOTHING_ALPHA`` of the way
+# from its current value toward the raw key-driven target (full
+# scaling on press, 0 on release).  At lerobot-record's ~30 Hz poll:
+#   alpha=0.5  -> 50% catch-up per tick, ~75% within 67 ms (2 ticks)
+#   alpha=0.3  -> noticeably softer
+#   alpha=1.0  -> no smoothing (legacy step-function behaviour)
+# A small alpha is what cable insertion needs: it converts the
+# {-scale, 0, +scale} keyboard step-functions into continuous ramps so
+# recorded actions are smooth out of the box (no SavGol post-pass) and
+# the trained policy emits smooth velocities at inference.  Without
+# this every action column has only 2-3 unique values per axis with
+# ~73% all-zero frames -- exactly the failure mode of the existing
+# 201-episode SFP dataset.
+ACTION_SMOOTHING_ALPHA = 0.5
+
+# Snap-to-zero deadband: once the smoothed value drops below this
+# magnitude, force it to exact 0.  Stops the EMA from carrying an
+# asymptotic micro-velocity for many ticks after a key release, which
+# would otherwise pollute the dataset with permanent millimetre/sec
+# drift.  5e-4 is 0.5% of the 0.1 m/s EE scaling and 1% of the 0.05
+# rad/s joint scaling -- well below any meaningful robot motion.
+ACTION_DEADBAND = 5e-4
+
+
+def _ema_update(current: float, target: float) -> float:
+    """One-tick EMA step with snap-to-zero deadband."""
+    smoothed = ACTION_SMOOTHING_ALPHA * target + (1.0 - ACTION_SMOOTHING_ALPHA) * current
+    if abs(smoothed) < ACTION_DEADBAND:
+        smoothed = 0.0
+    return smoothed
+
 
 @TeleoperatorConfig.register_subclass("aic_keyboard_joint")
 @dataclass
@@ -60,6 +92,14 @@ class AICKeyboardJointTeleop(KeyboardJointTeleop):
             "wrist_1_joint": 0.0,
             "wrist_2_joint": 0.0,
             "wrist_3_joint": 0.0,
+        }
+
+        # Persistent EMA state for action smoothing -- see EE class
+        # comment.  Joint mode emits the same step-function pattern
+        # (val on press, 0 on release) without smoothing, so it
+        # benefits from the same fix.
+        self._smoothed_joint_actions: JointMotionUpdateActionDict = {
+            k: 0.0 for k in self.curr_joint_actions
         }
 
     @property
@@ -119,7 +159,12 @@ class AICKeyboardJointTeleop(KeyboardJointTeleop):
 
         self.current_pressed.clear()
 
-        return cast(dict, self.curr_joint_actions)
+        for k in self._smoothed_joint_actions:
+            self._smoothed_joint_actions[k] = _ema_update(
+                self._smoothed_joint_actions[k], self.curr_joint_actions[k]
+            )
+
+        return cast(dict, dict(self._smoothed_joint_actions))
 
 
 @TeleoperatorConfig.register_subclass("aic_keyboard_ee")
@@ -145,6 +190,15 @@ class AICKeyboardEETeleop(KeyboardEndEffectorTeleop):
             "angular.x": 0.0,
             "angular.y": 0.0,
             "angular.z": 0.0,
+        }
+
+        # Persistent EMA state.  ``_current_actions`` holds the raw
+        # key-driven target (snaps to ``+/- scaling`` on press, 0 on
+        # release); ``_smoothed_actions`` is what we publish to the
+        # robot and what lerobot-record writes to the dataset.  See
+        # ACTION_SMOOTHING_ALPHA at the top of the file.
+        self._smoothed_actions: MotionUpdateActionDict = {
+            k: 0.0 for k in self._current_actions
         }
 
     @property
@@ -204,7 +258,12 @@ class AICKeyboardEETeleop(KeyboardEndEffectorTeleop):
 
         self.current_pressed.clear()
 
-        return cast(dict, self._current_actions)
+        for k in self._smoothed_actions:
+            self._smoothed_actions[k] = _ema_update(
+                self._smoothed_actions[k], self._current_actions[k]
+            )
+
+        return cast(dict, dict(self._smoothed_actions))
 
 
 @TeleoperatorConfig.register_subclass("aic_spacemouse")
