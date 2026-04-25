@@ -63,6 +63,24 @@ Then re-run the verification block above.
 
 ---
 
+## Terminal layout — open these 5 terminals (in order)
+
+A full session uses 5 terminals running in parallel. **All five run inside the `aic_eval` distrobox** (`atang@aic_eval:...` prompt). Inside the distrobox `/scratch2/...` is remounted at `/run/host/scratch2/...`.
+
+| # | Terminal | Step that launches it | Lifetime | What it does |
+|---|---|---|---|---|
+| **T1** | Gazebo | Step 1 | whole session | Simulator with the robot, task board, and plug |
+| **T2** | Pre-flight checks → `lerobot-record` | Step 2 → Step 5 | whole session | The recording process. Reused first for the 60 s sanity checks, then becomes your teleop console (arrow keys to save/discard, motion keys to drive). |
+| **T3** | `force_monitor.py` | Step 5.5 | whole session | Live Tier-2 force dashboard. Read-only — passively shows tared force magnitude in green/yellow/red so you can back off before the −12 pt penalty triggers. |
+| **T4** | `tare.sh` | Step 4 (first call), then between every episode | reused | Refreshes the F/T zero point. Single command, half a second per call. Used at session start and again between every episode. |
+| **T5** | `ros2 topic echo /scoring/insertion_event` | Step 5.5 | whole session | Live confirmation that the simulator's scoring plugin agrees the insertion succeeded. Useful for spotting cases where you *think* the insertion worked but it didn't latch. |
+
+If you only have monitor real-estate for 3 windows, drop T4 and T5 first — those are advisory and can run in tabs/screen sessions instead. T1–T3 are the minimum: simulator, recorder, force display.
+
+The rest of this document walks through these in order.
+
+---
+
 ## Step 1 — Launch Gazebo
 
 > **Paste tip:** copy each command as **one single line** — do not use backslash line continuations when pasting into the terminal. Some terminals insert invisible trailing whitespace after `\` which breaks the continuation and causes errors like `malformed launch argument ' '`. If a command is shown here with `\` continuations for readability, join them into one line before pasting.
@@ -134,9 +152,11 @@ ls "$DATASET_ROOT" 2>/dev/null && echo "EXISTS — pick a different path or dele
 
 ---
 
-## Step 4 — Tare the F/T sensor (once per session, then again per episode)
+## Step 4 — Tare the F/T sensor (T4 — once per session, then again per episode)
 
-The tare offset is published live on `/aic_controller/controller_state` and the lerobot driver subtracts it on every recorded frame. Re-taring instantly shifts what gets written into the parquet — no need to stop `lerobot-record`. Just keep one terminal open with this command available:
+Open **Terminal 4** (`source setup_dev.sh` first). Keep this terminal alive for the entire session — you'll come back to it before every episode.
+
+The tare offset is published live on `/aic_controller/controller_state` and the lerobot driver subtracts it on every recorded frame. Re-taring instantly shifts what gets written into the parquet — no need to stop `lerobot-record`. The command is:
 
 ```bash
 bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh
@@ -156,9 +176,9 @@ Expected output ends with `success=True, message='Successfully tared force torqu
 
 ---
 
-## Step 5 — Start lerobot-record
+## Step 5 — Start lerobot-record (T2)
 
-Terminal 2 (after sanity checks and tare passed). Copy-paste the single-line form below. Do **not** use the readable version's backslash line continuations — some terminals insert trailing whitespace that breaks them:
+Back in **Terminal 2** (after sanity checks and the first tare pass from Step 4). Copy-paste the single-line form below. Do **not** use the readable version's backslash line continuations — some terminals insert trailing whitespace that breaks them:
 
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic && pixi run lerobot-record --robot.type=aic_controller --robot.id=aic --teleop.type=aic_keyboard_ee --teleop.id=aic --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link --dataset.repo_id=local/teleop_sfp_ft --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset-ft-v1 --dataset.single_task="insert SFP" --dataset.fps=20 --dataset.push_to_hub=false --dataset.private=true --play_sounds=false --display_data=true
@@ -194,13 +214,61 @@ pixi run lerobot-record \
 
 If you get `FileExistsError`, the dataset path already has stuff in it. Either add `--resume=true` (if you want to continue that dataset) or pick a different path.
 
+Once `lerobot-record` is running and waiting on its first keypress, **don't drive yet** — open the two operator-feedback terminals first.
+
+---
+
+## Step 5.5 — Open the operator-feedback terminals (T3 and T5)
+
+These two terminals don't write to the dataset — they just feed information back to you while `lerobot-record` is running. Open them now, before pressing Right Arrow on the first episode.
+
+### T3 — `force_monitor.py` (live tared-force dashboard)
+
+In a new terminal (`source setup_dev.sh` first):
+
+```bash
+pixi run python /run/host/scratch2/atang/ws_aic/scripts/force_monitor.py
+```
+
+What you see: a single line that updates several times a second showing the tared force magnitude in N, color-coded (green / yellow / red) against the Tier-2 penalty thresholds. **It is purely a display** — it does not subscribe to the parquet or interfere with recording. Its only job is to give you a live "am I pressing too hard" signal so you can back off before the simulator deducts points.
+
+This terminal also doubles as your in-loop confirmation that `tare.sh` worked: after a successful tare, the displayed force should snap to ≈0 N within one update cycle. If it stays at 5+ N after a tare, the gripper was probably still in contact — back off and re-tare.
+
+### T5 — `/scoring/insertion_event` echo (live success/fail confirmation)
+
+In another new terminal (`source setup_dev.sh` first):
+
+```bash
+ros2 topic echo /scoring/insertion_event
+```
+
+What you see: nothing, until the simulator's scoring plugin decides an insertion event has occurred. Then it prints a `std_msgs/String` payload describing the event (success / partial / failure with reason). 
+
+This is your **ground-truth check on whether you actually inserted the cable.** It catches the case where the plug visually looks seated but the contact patches in the scoring plugin disagree — without this terminal you'd save a "good" episode that the scoring plugin will later mark as a failure during eval. If you press Right Arrow and you haven't seen a success message on T5 in the last few seconds, consider whether the demo really succeeded.
+
+You can also use it inversely: if T5 announces success but you weren't sure, that's a confidence boost to save the episode.
+
+### Final terminal layout before recording
+
+You should now have all 5 terminals open:
+
+```
+T1: Gazebo (Step 1)            — running, simulator visible
+T2: lerobot-record (Step 5)    — running, waiting for Right Arrow
+T3: force_monitor.py           — running, showing ~0 N (post-tare)
+T4: tare.sh ready               — idle prompt, ready to re-tare
+T5: ros2 topic echo /scoring/insertion_event — running, silent
+```
+
+Keyboard focus stays in **T2** the whole time you're driving (T2 is the only terminal that needs key input — arrow keys to save/discard, motion keys to drive). Switch focus to T4 only during the per-episode reset window to run `tare.sh`. Glance at T3 and T5 — never type into them.
+
 ---
 
 ## Step 6 — Record ONE test episode and verify
 
 Do one episode before committing to a long session. Run the 5-axis wiggle drill (see Step 7's "Action-axis coverage drill" below) at the start, then drive the plug around. Doesn't have to be a successful insertion. Press **Right Arrow** to save.
 
-Then Ctrl+C to stop lerobot-record. In a third terminal:
+Then Ctrl+C to stop lerobot-record (T2). The verification script below is one-shot — run it in any spare terminal (T4 is the natural choice since you're not actively taring during verification, or open a temporary T6):
 
 ```bash
 pixi run python3 -c "
@@ -280,19 +348,20 @@ The motion per tap is small (≤ ~5° rotation, ≤ ~5 mm translation) — enoug
 
 A messy demo that hits all axes is more useful than a perfect demo that only descends.
 
-### Re-tare cadence
+### Per-episode reset window — full checklist (uses T2, T3, T4, T5)
 
-Per Step 4: re-tare **before pressing Right Arrow on every episode**. Quick checklist for the per-episode reset window:
+Per Step 4: re-tare **before pressing Right Arrow on every episode**. The full per-episode loop, with which terminal you're touching at each step:
 
-1. Press Right Arrow to save the previous episode.
-2. Move the arm back to the start pose, plug in hand, no contact.
-3. Run `bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh` from your tare terminal.
-4. Glance at `force_monitor.py` — the displayed force should snap to ~0 N. That's your in-loop confirmation the tare succeeded. If it doesn't snap to zero, the gripper was probably still touching the receptacle — back off and re-tare.
-5. Press Right Arrow to start the next episode.
-6. Run the 5-axis wiggle drill above for the first ~3 seconds of the episode.
-7. Then attempt the insertion.
+1. **(T2)** Watch for **success on T5** — the `/scoring/insertion_event` echo prints a success message when the cable latches. That's your green light to save.
+2. **(T2)** Press **Right Arrow** to save the previous episode. (Press **Left Arrow** instead if T5 didn't confirm a success and you want to discard.)
+3. **(T2 motion keys)** Move the arm back to the start pose, plug in hand, no contact with the board.
+4. **(T4)** Run `bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh`.
+5. **(T3)** Glance at `force_monitor.py` — the displayed force should snap to ~0 N within one update. That's your in-loop confirmation the tare succeeded. If it doesn't snap to zero, the gripper was probably still touching the receptacle — back off and re-tare.
+6. **(T2)** Press **Right Arrow** to start the next episode.
+7. **(T2)** Run the 5-axis wiggle drill above for the first ~3 seconds of the episode.
+8. **(T2)** Then attempt the insertion. Watch T5 for the success message and loop back to step 1.
 
-`lerobot-record` continues running through all of this — the tare is a single ROS service call that takes ~half a second and is picked up by the driver on the next frame.
+`lerobot-record` (T2) continues running through all of this — the tare is a single ROS service call that takes ~half a second and is picked up by the driver on the next frame.
 
 **Session targets:**
 
