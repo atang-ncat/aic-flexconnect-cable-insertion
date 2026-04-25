@@ -134,9 +134,9 @@ ls "$DATASET_ROOT" 2>/dev/null && echo "EXISTS — pick a different path or dele
 
 ---
 
-## Step 4 — Tare the F/T sensor (once per session)
+## Step 4 — Tare the F/T sensor (once per session, then again per episode)
 
-Move the arm to a free-space pose with the plug in hand and no contact (the launch's default pose is fine). From any terminal in the distrobox:
+The tare offset is published live on `/aic_controller/controller_state` and the lerobot driver subtracts it on every recorded frame. Re-taring instantly shifts what gets written into the parquet — no need to stop `lerobot-record`. Just keep one terminal open with this command available:
 
 ```bash
 bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh
@@ -144,7 +144,15 @@ bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh
 
 Expected output ends with `success=True, message='Successfully tared force torque sensor.'`.
 
-If you skip this, the wrench baseline includes a stale gravity-projection offset; the policy will see a slowly-drifting "contact force" across episodes that has nothing to do with the task. For SFP one tare per session is enough; for SC re-run between scene changes if the gripper rotated noticeably.
+**When to run it:**
+
+1. **Once at session start**, while the arm is in its launch pose with the plug grasped — this gives `force_monitor.py` a clean zero to display from.
+2. **Before pressing Right Arrow on every episode**, while the arm is back at the start pose (no contact). One half-second extra per episode.
+3. **After any scene change** (cable repositioned on the board, controller restart, gripper rotated > ~10° from the last tare).
+
+**Empirical evidence this matters:** in early test recordings, mean `force_z` drifted from -3 N (ep 0) to +18 N (ep 1, 2) — a 21 N spread across just 3 episodes when no per-episode tare was done. With the per-episode tare protocol above, a later 5-episode batch held mean `force_z` between -1.0 N and -1.9 N — **a 1 N spread**. The protocol is what makes the wrench column trainable.
+
+**Do not run `tare.sh` mid-episode** — it would inject a step discontinuity into the recorded wrench. Only run it during the reset window between episodes, while the arm is in free space.
 
 ---
 
@@ -190,7 +198,7 @@ If you get `FileExistsError`, the dataset path already has stuff in it. Either a
 
 ## Step 6 — Record ONE test episode and verify
 
-Do one episode before committing to a long session. Drive the plug around for 5–10 seconds — exercise *every* axis (a/d/w/s/r/f for translation, q/e/Shift+a/d/Shift+s/w for rotation). Doesn't have to be a successful insertion. Press **Right Arrow** to save.
+Do one episode before committing to a long session. Run the 5-axis wiggle drill (see Step 7's "Action-axis coverage drill" below) at the start, then drive the plug around. Doesn't have to be a successful insertion. Press **Right Arrow** to save.
 
 Then Ctrl+C to stop lerobot-record. In a third terminal:
 
@@ -223,12 +231,12 @@ What you want to see:
 | Check | Good | Bad — stop and diagnose |
 |---|---|---|
 | `state shape: (_, 39)` | Yes | 26 → old driver. 32 → joint_velocities patch not active. |
-| Joint velocity columns `std` > 0 on at least one joint | Yes | All zeros → `/joint_states` lacks velocity, or driver fallback hit |
+| Joint velocity columns `std` > 0 on at least 5 of 7 joints | Yes | All zeros → `/joint_states` lacks velocity, or driver fallback hit. (`jv.1` near zero is expected — that's the gripper joint under alphabetical sort.) |
 | Wrench columns `std` > 0.1 on at least one axis | Yes | All zeros → F/T not publishing |
-| Wrench columns `max abs` in [0.5, 10.0] range | Yes | All near 0 or > 50 → tare broken (re-run `tare.sh`) |
-| Action `n_unique` > 10 per actively-used dim | Yes | Only 3 values → EMA not active in `aic_teleop.py` |
+| Wrench `mean fz` in [-3, +3] N | Yes | \|mean fz\| > 5 N → stale tare (re-run `tare.sh` and re-record). High `max abs` (>20 N) is fine — that's real contact signal during jam attempts. |
+| Action `n_unique` > 10 per actively-used dim, **and all 6 dims appear in [-, +] range** | Yes | Only 3 values per dim → EMA not active in `aic_teleop.py`. Any dim only one-sided → wiggle drill skipped that key. |
 
-Only proceed to full recording if **all five checks pass.** If any fail, re-verify the driver install (Step 0) and the Gazebo sensor publishing (Step 2). Do not record a full session on a broken setup.
+Only proceed to full recording if **all five checks pass.** If any fail, re-verify the driver install (Step 0), the Gazebo sensor publishing (Step 2), the tare protocol (Step 4), and that you actually ran the 5-axis wiggle drill. Do not record a full session on a broken setup.
 
 ---
 
@@ -244,25 +252,47 @@ Follow the teleoperation technique in `teleop_guide.md` sections 2–10 for the 
 - Keep demos with corrections and recoveries — they are the most valuable training signal
 - Take a 5-minute break every 20 minutes
 
-### Action-axis coverage (mandatory operator habit)
+### Action-axis coverage drill (mandatory at the start of every episode)
 
-The previous 201-episode corpus had `angular.y` literally 0 in 100% of frames, `angular.z` 0 in 97.8%, `linear.x` 0 in 96.5%, and `linear.y` 0 in 95.7% — i.e. the dataset basically only contains `linear.z` (descent) and a little `angular.x`. A policy trained on that has no learned response for the other four axes. Across this new corpus, **every key must be pressed in at least 5–10% of episodes**, even when the board pose makes them strictly unnecessary.
+**Why this exists:** the previous 201-episode corpus had `angular.y` literally 0 in 100% of frames, `angular.z` 0 in 97.8%, `linear.x` 0 in 96.5%, and `linear.y` 0 in 95.7% — i.e. the dataset basically only contained `linear.z` (descent) and a little `angular.x`. A policy trained on that has no learned response for the other four axes. The first batches of the new dataset still showed `angular.y` at 0% until the wiggle drill below was made mandatory.
 
-Concrete drill (~20 s per episode):
+**The 5-axis wiggle (≈3 seconds at episode start, before any insertion attempt):**
+
+| Axis | Negative key | Positive key | Hold each |
+|---|---|---|---|
+| `linear.x` | `a` | `d` | ~0.3 s |
+| `linear.y` | `w` | `s` | ~0.3 s |
+| `angular.x` (roll) | `Shift+S` | `Shift+W` | ~0.3 s |
+| `angular.y` (**pitch — most skipped**) | `Shift+A` | `Shift+D` | ~0.3 s |
+| `angular.z` (**yaw — second most skipped**) | `q` | `e` | ~0.3 s |
+
+Skip `linear.z` from the wiggle — you'll exercise it during the descent itself.
+
+The motion per tap is small (≤ ~5° rotation, ≤ ~5 mm translation) — enough to register in the recorded action stream, not enough to disturb the start pose. EMA smoothing turns each 0.3 s tap into a brief ramp, which is even better learning signal than a single-step impulse.
+
+**The two keys most operators forget:** `Shift+A`/`Shift+D` for pitch (because the keyboard combo is unusual) and `q`/`e` for yaw (because it feels redundant when the actual insertion doesn't need yaw). Empirically, even after operators are reminded about pitch they still skip yaw — when you finish the pitch wiggle, **deliberately tap `q` then `e` before starting the descent**. Ten extra key presses per episode in exchange for a policy that can command yaw at all.
+
+**During the actual insertion attempt (after the wiggle):**
 
 - Approach the port on a deliberately offset trajectory, then correct with `a/d` and `w/s`.
-- Once roughly above the port, do a small `q/e` yaw wiggle and `Shift+a/d` pitch wiggle before descending.
 - Vary which axis you descend on: pure `f` half the time, mixed with light `a/s` corrections the rest.
+- Use `k` for slow mode within ~3 cm of the port.
 
-The point is exposing the policy to non-degenerate examples of each axis, not pretty trajectories. A messy demo that hits all axes is more useful than a perfect demo that only descends.
+A messy demo that hits all axes is more useful than a perfect demo that only descends.
 
 ### Re-tare cadence
 
-- Always at session start (Step 4 above).
-- After any scene change that involves repositioning the cable on the board.
-- Before any episode where the gripper has been rotated more than ~10° cumulative since the last tare.
+Per Step 4: re-tare **before pressing Right Arrow on every episode**. Quick checklist for the per-episode reset window:
 
-Just `bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh` from another terminal — `lerobot-record` continues running through it.
+1. Press Right Arrow to save the previous episode.
+2. Move the arm back to the start pose, plug in hand, no contact.
+3. Run `bash /run/host/scratch2/atang/ws_aic/scripts/tare.sh` from your tare terminal.
+4. Glance at `force_monitor.py` — the displayed force should snap to ~0 N. That's your in-loop confirmation the tare succeeded. If it doesn't snap to zero, the gripper was probably still touching the receptacle — back off and re-tare.
+5. Press Right Arrow to start the next episode.
+6. Run the 5-axis wiggle drill above for the first ~3 seconds of the episode.
+7. Then attempt the insertion.
+
+`lerobot-record` continues running through all of this — the tare is a single ROS service call that takes ~half a second and is picked up by the driver on the next frame.
 
 **Session targets:**
 
