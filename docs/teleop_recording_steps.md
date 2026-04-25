@@ -45,15 +45,19 @@ Expected output:
 teleop EMA alpha = 0.5
 ```
 
-If you see `26 fields` / `32 fields` / `wrench: False` / `joint_velocities: False` or an `ImportError` for `ACTION_SMOOTHING_ALPHA`, the driver edits are not active in your environment. The fix is to symlink the source files into the pixi env (mirroring what's already done for `aic_robot_aic_controller.py`):
+If you see `26 fields` / `32 fields` / `wrench: False` / `joint_velocities: False`, or `lerobot-record` fails at startup with `Could not import third-party plugin: lerobot_robot_aic` / `ModuleNotFoundError: No module named 'lerobot_robot_aic.aic_robot_aic_controller'`, the driver edits are not active in your environment. The fix is to symlink the source files into the pixi env using **relative** paths so the symlinks resolve correctly both on the host and inside the `aic_eval` distrobox (where `/scratch2/...` is remounted at `/run/host/scratch2/...`).
+
+Run from the **host** shell (not inside the distrobox), so `/scratch2/...` paths resolve:
 
 ```bash
 cd /scratch2/atang/ws_aic/src/aic/.pixi/envs/default/lib/python3.12/site-packages/lerobot_robot_aic
 rm -f aic_teleop.py aic_robot_aic_controller.py
-ln -s /scratch2/atang/ws_aic/src/aic/aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_teleop.py
-ln -s /scratch2/atang/ws_aic/src/aic/aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_robot_aic_controller.py
+ln -srv /scratch2/atang/ws_aic/src/aic/aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_teleop.py aic_teleop.py
+ln -srv /scratch2/atang/ws_aic/src/aic/aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_robot_aic_controller.py aic_robot_aic_controller.py
 rm -rf __pycache__
 ```
+
+The `-r` flag converts the absolute path to a relative one (`../../../../../../../aic_utils/...`), which works under any mount point. **Do not use `ln -s` without `-r`** — absolute symlinks made on the host point at `/scratch2/...` paths that don't exist inside the distrobox, and `lerobot-record` will fail to import the plugin.
 
 Then re-run the verification block above.
 
