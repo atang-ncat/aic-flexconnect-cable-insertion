@@ -1,0 +1,204 @@
+# ACT v10 — first run on the F/T-enabled, EMA-smoothed lerobot teleop dataset
+#
+# What changed from v9
+# --------------------
+# Data:
+#   * dataset.root: teleop-dataset-ft-v1
+#     115 episodes (100 train / 15 val) collected with the corrected lerobot
+#     driver: EMA-smoothed actions (alpha=0.5 in aic_teleop.py), F/T sensor
+#     wrench in observation.state (6 extra dims), and joint velocities
+#     included (7 extra dims).  See docs/teleop_recording_steps.md.  Total
+#     observation.state is 39-D pre-filter.
+#   * Per-episode F/T tare protocol held |mean fz| <= 3 N on 110/115 eps and
+#     0/115 eps had stale tare (>5 N).  Bias-free wrench signal.
+#   * Action coverage: all 6 dims bidirectional for the first time.  Pitch
+#     (angular.y) and yaw (angular.z) are sparse (1.4% / 5.1% non-zero
+#     globally) but present.  Action-weighted L1 (below) keeps the policy
+#     focused on motion frames so this sparsity isn't fatal.
+#
+# Policy:
+#   * No architectural changes from v9.  We want a clean baseline on the
+#     new data before we start tuning.
+#   * Step budget halved (40k vs 80k) -- with only 100 train episodes
+#     ACT plateaus earlier than the prior 151-ep smoothed run (v9 was
+#     never actually run; v6b on 170 eps plateaued by ~30k).
+#   * Eval cadence doubled (1k vs 2k) -- we want fine-grained val curves
+#     since the dataset is small.
+#   * Early-stopping windows scaled down proportionally (min_steps 8k,
+#     patience 6k).
+#
+# Loss / data hygiene:
+#   * action_weighting: kept (scale=0.03, floor=0.1).  The audit showed
+#     26.3% of frames have ||action||~0; weighting redirects gradient to
+#     the motion frames.
+#   * trim_tail_fraction: 0.05 (kept).  Median trailing-idle was 1.6 s
+#     out of 24.6 s avg episode = ~6.5%, so we catch most of it.  Combined
+#     with action_weighting this should be sufficient.
+#   * stats_train_only: true (kept) -- val episodes do not contaminate
+#     normalization moments.
+#
+# State filter:
+#   * Drop tcp_velocity.* (cols 7-12) and tcp_error.* (cols 13-18) for
+#     state-leakage prevention.  Net 27-D state to the policy:
+#       7 tcp_pose + 7 joint_positions + 7 joint_velocities + 6 wrench.
+#
+# Launch:
+#   # Recommended: single-GPU job on physical GPU 1 (tunable via CUDA_DEVICE_ID)
+#   /scratch2/atang/ws_aic/scripts/launch_train_act_ft_v1.sh
+#
+#   # Data health check
+#   python /scratch2/atang/ws_aic/scripts/audit_teleop_dataset.py
+#
+#   Manual (equivalent to launch script with CUDA_DEVICE_ID=1):
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=1 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v10.yaml
+
+run_name: v10_ft_v1_115ep_baseline
+# auto (default): if outputs/act_sfp/<run_name> already has train.log or checkpoints/,
+# use <run_name>_YYYYMMDD_HHMMSS instead.  error | overwrite also supported.
+# run_dir_collision: auto
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  # Workspace-relative; train_act.py resolves it against <config>/../..
+  # so the same path works on the host AND inside the aic_eval distrobox
+  # (where /scratch2/... is remounted at /run/host/scratch2/...).
+  root: teleop-dataset-ft-v1
+  repo_id: local/teleop_sfp_ft
+  video_backend: pyav
+  val_num_episodes: 15
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  # Drop leaky velocity/error channels.  Net 27-D state:
+  # tcp_pose (7) + joint_positions (7) + joint_velocities (7) + wrench (6).
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 40_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+action_weighting:
+  enable: true
+  scale: 0.03
+  floor: 0.1
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 6_000
+  min_delta: 0.0002
+  min_steps: 8_000
+
+evaluation:
+  eval_freq: 1_000
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v10", "3cam", "ft-sensor", "joint-velocities", "ema-smoothed", "ft-v1", "27d-state", "115ep", "baseline"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+  # Temporal ensembling re-queries the policy on every frame and blends
+  # predictions from up to chunk_size overlapping past chunks, so
+  # n_action_steps MUST be 1 (lerobot enforces this in
+  # configuration_act.py:__post_init__).  chunk_size still controls the
+  # training prediction horizon (2.5 s @ 20 fps).
+  n_action_steps: 1
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  # Temporal ensemble: blend predictions from overlapping past chunks at
+  # inference.  coeff=0.01 is the ACT paper default.  At fps=20 with
+  # chunk_size=50 the chunk horizon is 2.5 s; ensembling over the most
+  # recent ~10 overlapping chunks smooths transient prediction noise
+  # without lagging the policy.
+  temporal_ensemble_coeff: 0.01
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: MEAN_STD

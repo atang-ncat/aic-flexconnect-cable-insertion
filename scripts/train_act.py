@@ -19,8 +19,15 @@ eval) can handle both.  Key differences from ``train_vqbet.py``:
       removes the CPU-aug contention we observed when running multiple ACT
       jobs in parallel (load avg 300+ with 4 jobs, ~60 with GPU aug).
     * ``best`` symlink tracks the lowest ``val/l1_loss`` we have observed.
+    * ``run_dir_collision`` (default ``auto``): if ``output_dir/run_name`` already
+      contains a prior run (``train.log`` or ``checkpoints/``), a new suffix
+      ``_{timestamp}`` is used so two jobs with the same ``run_name`` do not
+      overwrite checkpoints.  Use ``error`` to fail fast, or ``overwrite`` to
+      allow reuse (not safe for parallel runs).
 
 Typical launch (from the workspace root):
+
+    ./scripts/launch_train_act_ft_v1.sh   # F/T dataset v1 on GPU 1 (see script for CUDA_DEVICE_ID)
 
     cd /scratch2/atang/ws_aic/src/aic && pixi run python \\
         /scratch2/atang/ws_aic/scripts/train_act.py \\
@@ -1202,11 +1209,68 @@ def init_wandb(cfg: dict, run_dir: Path, run_name: str):
     )
 
 
+def _run_dir_looks_in_use(path: Path) -> bool:
+    """True if path exists and already holds a run (log or checkpoints)."""
+    if not path.is_dir():
+        return False
+    return (path / "train.log").is_file() or (path / "checkpoints").is_dir()
+
+
+def resolve_run_dir_and_name(
+    output_dir: Path, run_name: str, timestamp: str, mode: str
+) -> tuple[Path, str]:
+    """Pick a unique run subdir so two jobs with the same run_name do not clobber.
+
+    * ``auto`` (default): if ``output_dir/run_name`` is already a run, use
+      ``{run_name}_{timestamp}``, then ``{run_name}_{timestamp}_2``, etc.
+    * ``error``: raise if the directory is already in use.
+    * ``overwrite``: use ``output_dir/run_name`` as before (can corrupt parallel runs).
+    """
+    m = (mode or "auto").lower()
+    if m not in ("auto", "error", "overwrite"):
+        raise ValueError(
+            f"run_dir_collision must be auto|error|overwrite, got {mode!r}"
+        )
+    run_dir = output_dir / run_name
+    if not _run_dir_looks_in_use(run_dir):
+        return run_dir, run_name
+    if m == "overwrite":
+        log.warning(
+            "run_dir_collision=overwrite: reusing in-use run dir %s (unsafe if another job is writing).",
+            run_dir,
+        )
+        return run_dir, run_name
+    if m == "error":
+        raise FileExistsError(
+            f"Run directory already in use: {run_dir} "
+            f"(remove it, pick a different run_name, or set run_dir_collision: auto in the config)."
+        )
+    # auto: disambiguate with timestamp, then _2, _3, ...
+    candidate = f"{run_name}_{timestamp}"
+    run_dir = output_dir / candidate
+    n = 2
+    while _run_dir_looks_in_use(run_dir):
+        candidate = f"{run_name}_{timestamp}_{n}"
+        run_dir = output_dir / candidate
+        n += 1
+    log.info(
+        "Run name %r was already in use; using %r to avoid clobbering outputs.",
+        run_name,
+        candidate,
+    )
+    return run_dir, candidate
+
+
 def train(cfg: dict) -> None:
-    # --- Run dir ---
+    # --- Run dir (avoid two concurrent jobs with the same run_name sharing one folder) ---
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = cfg.get("run_name") or f"act_sfp_{timestamp}"
-    run_dir = Path(cfg["output_dir"]) / run_name
+    collision = str(cfg.get("run_dir_collision", "auto"))
+    output_root = Path(cfg["output_dir"])
+    run_dir, run_name = resolve_run_dir_and_name(
+        output_root, run_name, timestamp, collision
+    )
+    cfg["run_name"] = run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(run_dir)
     log.info("Run dir: %s", run_dir)
@@ -1271,6 +1335,22 @@ def train(cfg: dict) -> None:
     policy.to(device)
     policy.train()
 
+    # --- Backbone freezing (v11 intervention for small datasets) ---
+    # When optimizer_lr_backbone == 0, freeze all backbone parameters entirely.
+    # This prevents the ImageNet-pretrained ResNet from overfitting on <50k frames
+    # and removes ~11M params from the optimizer state (saves GPU memory too).
+    if policy_cfg.optimizer_lr_backbone == 0:
+        n_frozen = 0
+        for n, p in policy.named_parameters():
+            if n.startswith("model.backbone"):
+                p.requires_grad_(False)
+                n_frozen += p.numel()
+        log.info(
+            "Backbone FROZEN: set requires_grad=False on %d params (%.1fM) "
+            "because optimizer_lr_backbone=0.",
+            n_frozen, n_frozen / 1e6,
+        )
+
     # Stats for the preprocessor:
     #   1. Baseline = train_ds.meta.stats (from meta/stats.json at build time).
     #   2. If dataset.stats_train_only, recompute state+action stats from
@@ -1299,8 +1379,44 @@ def train(cfg: dict) -> None:
 
     # --- Optimizer (ACTConfig only exposes AdamW) ---
     optimizer = policy_cfg.get_optimizer_preset().build(policy.get_optim_params())
-    sched_preset = policy_cfg.get_scheduler_preset()
-    lr_scheduler = sched_preset.build(optimizer, cfg["training"]["steps"]) if sched_preset else None
+
+    # --- LR scheduler (v11: cosine warmup+decay for small datasets) ---
+    # ACTConfig.get_scheduler_preset() returns None (no scheduler at all).
+    # When ``lr_schedule`` is present in the config, we build a warmup+cosine
+    # schedule ourselves.  Backward-compatible: configs without ``lr_schedule``
+    # get a constant LR as before.
+    lr_scheduler = None
+    lr_sched_cfg = cfg.get("lr_schedule")
+    if lr_sched_cfg and lr_sched_cfg.get("enable", True):
+        from torch.optim.lr_scheduler import (
+            CosineAnnealingLR,
+            LinearLR,
+            SequentialLR,
+        )
+        warmup_steps = int(lr_sched_cfg.get("warmup_steps", 500))
+        total = int(cfg["training"]["steps"])
+        min_lr_ratio = float(lr_sched_cfg.get("min_lr_ratio", 0.01))
+        # LinearLR ramps from start_factor → end_factor over total_iters.
+        warmup = LinearLR(
+            optimizer, start_factor=min_lr_ratio, end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        # CosineAnnealingLR decays from current LR to eta_min over T_max.
+        base_lr = policy_cfg.optimizer_lr
+        cosine = CosineAnnealingLR(
+            optimizer, T_max=total - warmup_steps,
+            eta_min=base_lr * min_lr_ratio,
+        )
+        lr_scheduler = SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
+        )
+        log.info(
+            "LR schedule: linear warmup %d steps -> cosine decay to %.1e over %d steps",
+            warmup_steps, base_lr * min_lr_ratio, total - warmup_steps,
+        )
+    else:
+        sched_preset = policy_cfg.get_scheduler_preset()
+        lr_scheduler = sched_preset.build(optimizer, cfg["training"]["steps"]) if sched_preset else None
 
     # --- Augmenter (train-only) ---
     aug = ImageAugmenter(
@@ -1604,8 +1720,8 @@ def train(cfg: dict) -> None:
 
     elapsed = time.perf_counter() - t_start
     log.info(
-        "Training complete. %d steps in %.1fs (%.2f steps/s).",
-        total_steps, elapsed, total_steps / max(elapsed, 1e-9),
+        "Training complete. %d/%d steps in %.1fs (%.2f steps/s).",
+        step, total_steps, elapsed, step / max(elapsed, 1e-9),
     )
 
     if wandb_run is not None:

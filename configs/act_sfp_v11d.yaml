@@ -1,0 +1,189 @@
+# ACT v11d — lower KL weight ablation (1.0 instead of 10.0)
+#
+# Delta from v11: kl_weight = 1.0 (10x lower VAE regularization)
+# Everything else identical.  In v10 the kld_loss dropped to 0.004 by step
+# 8000, indicating the VAE posterior collapsed to the prior.  The latent
+# wasn't encoding useful multimodal info.  Lower KL weight lets the VAE be
+# more informative, which should help with diverse action distributions.
+#
+# What changed from v10
+# --------------------
+# The v10 baseline on teleop-dataset-ft-v1 (115 episodes) showed classic
+# overfitting: val/l1_loss bottomed at 0.264 by step 1000 and never improved
+# through step 8000, while train loss kept dropping 97% (13.8 → 0.36).
+# The best checkpoint (step 1000) scored 57.57 in simulation: the robot
+# approached the SFP port correctly but actions were too timid (~5 mm/s)
+# and it ran out of time before completing insertion.
+#
+# Root causes:
+#   1. No LR schedule (flat 1e-5 for the entire run)
+#   2. All 17.1M params trainable including ImageNet backbone on <50k frames
+#   3. Modest regularization (dropout=0.1, weight_decay=5e-4)
+#
+# Fixes in v11:
+#   * Cosine LR schedule with 500-step linear warmup, decaying to 1e-7.
+#     This is the highest-impact single change — at step 1000 the LR will
+#     still be ~9.8e-6 (near peak), by step 5000 it'll be ~5e-6, and by
+#     step 10000 it'll be ~2e-6.  The model stays near the good basin found
+#     early instead of drilling into a narrow training-loss minimum.
+#   * Frozen ResNet18 backbone (optimizer_lr_backbone: 0.0).  Removes ~11M
+#     params from the optimizer, leaving only ~6M trainable (transformer +
+#     projection heads).  ImageNet features are already effective for
+#     manipulation; fine-tuning them on <50k frames is pure overfitting.
+#   * Higher dropout (0.1 → 0.3) for additional transformer regularization.
+#   * Higher weight decay (5e-4 → 1e-3).
+#   * Shorter training budget (40k → 15k steps) since the model peaks
+#     early and the cosine schedule naturally anneals.
+#   * Tighter early stopping (patience 3k, min_steps 3k).
+#   * Finer eval cadence (500 steps) to precisely locate the best checkpoint.
+#
+# Launch:
+#   ./scripts/launch_train_act_v11.sh
+#
+#   Manual:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=1 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v11.yaml
+
+run_name: v11d_low_kl
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset (unchanged from v10)
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset-ft-v1
+  repo_id: local/teleop_sfp_ft
+  video_backend: pyav
+  val_num_episodes: 15
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 15_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# v11: Cosine warmup+decay LR schedule (new feature)
+lr_schedule:
+  enable: true
+  warmup_steps: 500
+  min_lr_ratio: 0.01   # min LR = optimizer_lr * 0.01 = 1e-7
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+action_weighting:
+  enable: true
+  scale: 0.03
+  floor: 0.1
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 3_000
+  min_delta: 0.0002
+  min_steps: 3_000
+
+evaluation:
+  eval_freq: 500
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 2_500
+  keep_last_n_checkpoints: 5
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v11d", "3cam", "ft-sensor", "joint-velocities",
+         "ema-smoothed", "ft-v1", "27d-state", "115ep",
+         "cosine-lr", "frozen-backbone", "low-kl"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 1
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  # v11d: lower KL weight to prevent VAE posterior collapse
+  kl_weight: 1.0
+
+  # v11: increased from 0.1
+  dropout: 0.3
+
+  optimizer_lr: 1.0e-5
+  # v11: backbone FROZEN (train_act.py sets requires_grad=False when this is 0)
+  optimizer_lr_backbone: 0.0
+  # v11: increased from 5e-4
+  optimizer_weight_decay: 1.0e-3
+
+  temporal_ensemble_coeff: 0.01
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: MEAN_STD
