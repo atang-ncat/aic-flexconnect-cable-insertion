@@ -33,23 +33,44 @@ After 15+ training runs and dozens of deployment evaluations, we established tha
 - **All other hyperparameter changes — KL weight, VAE removal, image normalization, chunk size, deploy-time gain — produced no improvement** beyond the noise band established by v13.
 - **The model consistently converges to a final plug-port distance of ~0.06m on trial 2**, regardless of any change we make. This 6cm gap represents a **data ceiling** — the 115-episode keyboard teleop dataset does not contain enough precision insertion demonstrations to teach the model the final approach phase.
 
-**Current best: v13 at 68.02 (SFP-only score).**
+**Current best: v13 at 68.02 / 300 (22.7%).** A perfect score requires three successful insertions.
 
 ---
 
 ## Scoring System
 
-The AIC engine scores each trial across three tiers:
-
-| Tier | What It Measures | Max Score |
-|------|-----------------|-----------|
-| **Tier 1** | Model validation (loads + runs) | 1 |
-| **Tier 2** | Trajectory quality (duration, efficiency, smoothness, contacts, force) | ~18 |
-| **Tier 3** | Insertion proximity / success | ~75 (full insertion = 75) |
+**Maximum score per trial: 100 points. Three trials = 300 points max.**
 
 Each evaluation runs 3 trials:
 - **Trial 1 & 2:** SFP plug → SFP port (two different NIC card positions)
 - **Trial 3:** SC plug → SC port (different cable type, never in training data)
+
+### Tier 1: Model Validity (0–1 point)
+
+Sanity check that the submission loads and runs. Pass = 1, Fail = 0.
+
+### Tier 2: Performance & Convergence (−36 to +24 points)
+
+| Category | Range | Details |
+|----------|-------|---------|
+| Trajectory smoothness | 0–6 | Inversely proportional to avg jerk (0 m/s³ = 6 pts, ≥50 m/s³ = 0 pts) |
+| Task duration | 0–12 | Inversely proportional to time (≤5s = 12 pts, ≥60s = 0 pts) |
+| Trajectory efficiency | 0–6 | Inversely proportional to path length vs initial distance |
+| Insertion force penalty | 0 to −12 | Penalty if force >20N for >1s |
+| Off-limit contact penalty | 0 to −24 | Penalty for collisions with enclosure/task board |
+
+> **Note:** Smoothness, duration, and efficiency are only awarded if the plug is within the max bounding radius of the port (tier 3 > 0). Otherwise they score 0.
+
+### Tier 3: Task Success (−12 to 75 points)
+
+| Outcome | Score |
+|---------|-------|
+| Correct port insertion | **75** |
+| Wrong port insertion | −12 |
+| Partial insertion (inside port bounding box) | 38–50 (proportional to depth) |
+| Proximity (near port but not inserted) | 0–25 (inversely proportional to distance) |
+
+The proximity score uses the max acceptable distance = half the initial plug-port distance. At the port entrance = 25 pts. Beyond max distance = 0 pts.
 
 ---
 
