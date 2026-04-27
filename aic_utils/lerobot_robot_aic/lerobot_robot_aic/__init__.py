@@ -16,6 +16,8 @@
 
 from .aic_robot_aic_controller import AICRobotAICController, AICRobotAICControllerConfig
 from .aic_teleop import (
+    AICGamepadEETeleop,
+    AICGamepadEETeleopConfig,
     AICKeyboardEETeleop,
     AICKeyboardEETeleopConfig,
     AICKeyboardJointTeleop,
