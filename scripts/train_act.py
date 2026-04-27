@@ -465,28 +465,31 @@ def _restrict_video_keys(meta, keep: list[str]) -> None:
     meta.__class__ = _FilteredMeta
 
 
-def trim_episode_tails(
-    ds: LeRobotDataset, tail_frac: float, min_keep: int = 1
+def trim_episode_boundaries(
+    ds: LeRobotDataset,
+    tail_frac: float = 0.0,
+    head_frac: float = 0.0,
+    min_keep: int = 1,
 ) -> Subset:
-    """Return a ``Subset`` of ``ds`` that drops the last ``tail_frac`` of frames
-    of each episode.
+    """Return a ``Subset`` of ``ds`` that drops the first ``head_frac`` and
+    last ``tail_frac`` fraction of frames from each episode.
 
     Why: the audit (``scripts/audit_teleop_data.py``) showed that ~60% of frames
-    are near-idle, and most of those idle frames cluster at the END of each
-    episode (post-insertion stillness after the operator stopped driving).
-    Training through those frames biases the model toward "predict zero" and
-    inflates the effective training set without adding useful signal.
+    are near-idle, and most of those idle frames cluster at the START (sim
+    settling, initial positioning) and END (post-insertion stillness) of each
+    episode.  Training through those frames biases the model toward "predict
+    zero" and inflates the effective training set without adding useful signal.
 
     We filter at the FRAME-INPUT level, not at the action-target level -- an
-    unfiltered frame whose chunk extends into the trimmed tail still uses the
-    tail's actions as targets (LeRobotDataset handles that via its delta-index
+    unfiltered frame whose chunk extends into the trimmed region still uses
+    those actions as targets (LeRobotDataset handles that via its delta-index
     padding).  That's intentional: we want the model to still learn "hold
     still" once insertion is done, just not be dominated by it.
 
     ``min_keep`` guards against degenerate-short episodes (e.g. teleop aborted
     early): we keep at least ``min_keep`` frames per episode no matter what.
     """
-    if tail_frac <= 0.0:
+    if tail_frac <= 0.0 and head_frac <= 0.0:
         return Subset(ds, list(range(len(ds))))
     ep_idx = np.asarray(ds.hf_dataset["episode_index"])
     kept: list[int] = []
@@ -495,16 +498,31 @@ def trim_episode_tails(
     for e in unique_eps:
         frame_positions = np.nonzero(ep_idx == e)[0]
         n = len(frame_positions)
-        keep_n = max(min_keep, int(round(n * (1.0 - tail_frac))))
-        kept.extend(frame_positions[:keep_n].tolist())
-        dropped += n - keep_n
+        head_drop = int(round(n * head_frac))
+        tail_drop = int(round(n * tail_frac))
+        # Ensure we keep at least min_keep frames
+        total_drop = head_drop + tail_drop
+        if n - total_drop < min_keep:
+            head_drop = 0
+            tail_drop = max(0, n - min_keep)
+        start = head_drop
+        end = n - tail_drop if tail_drop > 0 else n
+        kept.extend(frame_positions[start:end].tolist())
+        dropped += n - (end - start)
     log.info(
-        "Boundary trim: tail_frac=%.2f -> kept %d / %d frames (dropped %d, "
-        "~%.1f%% of %d episodes)",
-        tail_frac, len(kept), len(ds), dropped, 100.0 * dropped / max(len(ds), 1),
-        len(unique_eps),
+        "Boundary trim: head_frac=%.2f tail_frac=%.2f -> kept %d / %d frames "
+        "(dropped %d, ~%.1f%% of %d episodes)",
+        head_frac, tail_frac, len(kept), len(ds), dropped,
+        100.0 * dropped / max(len(ds), 1), len(unique_eps),
     )
     return Subset(ds, kept)
+
+
+def trim_episode_tails(
+    ds: LeRobotDataset, tail_frac: float, min_keep: int = 1
+) -> Subset:
+    """Backwards-compatible wrapper for ``trim_episode_boundaries``."""
+    return trim_episode_boundaries(ds, tail_frac=tail_frac, min_keep=min_keep)
 
 
 def make_datasets(
@@ -1444,9 +1462,12 @@ def train(cfg: dict) -> None:
 
     # --- Boundary-trim (v4 intervention; leaves val set untouched) ---
     tail_frac = float(cfg.get("dataset", {}).get("trim_tail_fraction", 0.0) or 0.0)
+    head_frac = float(cfg.get("dataset", {}).get("trim_head_fraction", 0.0) or 0.0)
     train_src: Any = train_ds
-    if tail_frac > 0.0:
-        train_src = trim_episode_tails(train_ds, tail_frac=tail_frac)
+    if tail_frac > 0.0 or head_frac > 0.0:
+        train_src = trim_episode_boundaries(
+            train_ds, tail_frac=tail_frac, head_frac=head_frac
+        )
 
     # --- Dataloaders ---
     train_loader = DataLoader(

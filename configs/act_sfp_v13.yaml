@@ -1,0 +1,188 @@
+# ACT v13 — fixed image normalization + aggressive action weighting + head trimming
+#
+# v12 scored 43.52 on SFP trials (trial_1: 26.81, trial_2: 15.70).
+# Robot correctly approaches the port but stops ~0.09-0.11m short.
+# Three independent improvements target the remaining gap:
+#
+#   1. VISUAL: IDENTITY (was MEAN_STD)
+#      The v12 normalizer computed image stats at the *per-image-mean* level:
+#        std ≈ 0.018 (variation in average brightness across episodes)
+#      This causes (pixel - 0.57) / 0.018, producing inputs in range [-30, +24].
+#      The FROZEN ResNet18 (pretrained on ImageNet, expects ~[0,1]) receives
+#      these extreme values.  Its FrozenBatchNorm2d uses ImageNet running stats
+#      and CANNOT adapt.  v10 partially compensated because its backbone was
+#      trainable.  With a frozen backbone, this is the single biggest bottleneck
+#      to spatial precision.
+#      Fix: IDENTITY passes raw [0,1] pixels directly to the backbone.
+#
+#   2. Stronger action_weighting: scale=0.02, floor=0.05 (was 0.03, 0.1)
+#      With 88-98% idle frames, v12's 10x upweighting is barely enough.
+#      Sharper scale (0.02) + lower floor (0.05) gives ~20x upweighting
+#      of moving frames, forcing the loss to care about the critical
+#      approach-and-insert timesteps.
+#
+#   3. Head trimming: trim_head_fraction=0.10
+#      Episodes start with long idle periods (sim settling, initial positioning).
+#      Cutting the first 10% removes ~5.6k useless zero-action frames.
+#      Combined with tail trim (5%), this removes ~15% of total frames.
+#
+# v12 baseline (SFP only):
+#   trial_1: 26.81  (final dist 0.09m, started 0.13m, path 0.06m)
+#   trial_2: 15.70  (final dist 0.11m, started 0.14m, path 0.05m)
+#   total : 42.51
+#
+# v13 targets:
+#   - val/l1_loss similar to v12's 0.244 (image norm change may shift this)
+#   - Normalized image inputs to backbone in range [0,1] (not [-30,+24])
+#   - Final plug-port distance < 0.05m on at least one SFP trial
+#
+# Launch:
+#   ./scripts/launch_train_act_v13.sh
+#
+#   Manual:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v13.yaml
+
+run_name: v13_fixed_img_norm
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset-ft-v1
+  repo_id: local/teleop_sfp_ft
+  video_backend: pyav
+  val_num_episodes: 15
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+  # v13 NEW: trim idle startup frames (sim settling, initial positioning)
+  trim_head_fraction: 0.10
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 15_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+lr_schedule:
+  enable: true
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# v13 CHANGE: more aggressive action weighting (~20x upweighting vs v12's ~10x)
+action_weighting:
+  enable: true
+  scale: 0.02       # was 0.03 → sharper weighting curve
+  floor: 0.05       # was 0.1  → idle frames get 20x less weight
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 3_000
+  min_delta: 0.0002
+  min_steps: 3_000
+
+evaluation:
+  eval_freq: 500
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 2_500
+  keep_last_n_checkpoints: 5
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v13", "3cam", "ft-sensor", "joint-velocities",
+         "ema-smoothed", "ft-v1", "27d-state", "115ep",
+         "cosine-lr", "frozen-backbone",
+         "identity-img-norm", "aggressive-action-weight", "head-trim"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 1
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 0.0
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: 0.01
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  # v13 KEY CHANGE: IDENTITY for images — pass raw [0,1] pixels to frozen
+  # ResNet instead of the broken MEAN_STD normalization (std=0.018 → [-30,+24])
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MEAN_STD
+    ACTION: MEAN_STD

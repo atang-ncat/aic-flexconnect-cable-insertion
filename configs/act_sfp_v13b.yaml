@@ -1,0 +1,202 @@
+# ACT v13b — lower KL weight + commit to longer action chunk at deploy
+#
+# Complementary experiment to v13 (which tweaks action_weighting).  v13b keeps
+# action_weighting at v12 settings and instead changes two things:
+#
+#   1. kl_weight: 10.0 -> 1.0
+#      The CVAE prior is N(0, I).  Under L1 + a strong KL term, the decoder is
+#      regularized to produce action distributions whose decoded samples sit
+#      near the dataset mean.  Since 75-98% of frames are idle, that mean is
+#      ~0, which compounds the timidity we see in v12 (deployed |a|_inf is
+#      1.4-4.3 mm/s while the path is correctly aimed at the port).
+#      Lowering kl_weight 10x lets the decoder commit to more decisive
+#      action sequences that match the active demonstrations, while still
+#      keeping the latent for representation purposes (vs disabling VAE
+#      entirely, which is a bigger change).
+#
+#   2. n_action_steps: 1 -> 25
+#      v12 re-queries the policy every step and relies on temporal_ensemble
+#      (coeff=0.01) to blend overlapping chunk predictions.  With idle-biased
+#      data the ensemble averages active predictions toward zero.  Bumping
+#      n_action_steps to 25 commits to half a chunk per inference and skips
+#      most of the smoothing.  This is mostly a deploy-time effect (the
+#      training loss is per-action either way) but it means the saved
+#      checkpoint defaults to the better deploy behavior.
+#
+# Why these two together (and not action_weighting): v12 already showed that
+# action_weighting at scale=0.03/floor=0.1 plus v10-level regularization
+# produces a model that aims correctly (trajectory_efficiency 6/6).  The
+# remaining gap is magnitude.  KL collapse and temporal averaging are both
+# "predicting too small", independent of the idle-vs-active reweighting that
+# v13 explores.  If v13b wins we have a different lever to combine with v13.
+#
+# v12 baseline (SFP only, ignoring SC trial):
+#   trial_1: 26.81  (final dist 0.09m, started 0.13m, path 0.06m)
+#   trial_2: 15.70  (final dist 0.11m, started 0.14m, path 0.05m)
+#   total : 42.51
+#
+# v13b targets:
+#   - |UNNORM action|_inf > 5 mm/s on iter 0 (vs v12's 1.4-4.3 mm/s)
+#   - val/l1_loss within 10% of v12's 0.260 (we're trading a little fit for
+#     more decisive outputs; significantly worse l1 means we overshot)
+#   - Final plug-port distance < 0.05m on at least one SFP trial
+#
+# Launch:
+#   ./scripts/launch_train_act_v13b.sh
+#   CUDA_DEVICE_ID=0 ./scripts/launch_train_act_v13b.sh
+#
+#   Manual:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v13b.yaml
+
+run_name: v13b_low_kl_long_chunk
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset (unchanged from v12)
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset-ft-v1
+  repo_id: local/teleop_sfp_ft
+  video_backend: pyav
+  val_num_episodes: 15
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop (unchanged from v12)
+# ---------------------------------------------------------------------------
+training:
+  steps: 15_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+lr_schedule:
+  enable: true
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# Kept at v12 settings on purpose — v13 explores this axis.
+action_weighting:
+  enable: true
+  scale: 0.03
+  floor: 0.1
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 3_000
+  min_delta: 0.0002
+  min_steps: 3_000
+
+evaluation:
+  eval_freq: 500
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 2_500
+  keep_last_n_checkpoints: 5
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v13b", "3cam", "ft-sensor", "joint-velocities",
+         "ema-smoothed", "ft-v1", "27d-state", "115ep",
+         "cosine-lr", "frozen-backbone", "low-kl", "long-chunk"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+
+  # v13b CHANGE #1: commit to half a chunk at deploy instead of relying on
+  # temporal_ensemble to blend single-step queries.  Pure deploy-time effect;
+  # training loss is unchanged.
+  n_action_steps: 25
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+
+  # v13b CHANGE #2: 10x smaller KL term.  The CVAE prior pulls decoded
+  # actions toward the latent prior under strong KL; with idle-biased data
+  # this reads as "stay near zero".  Loosening KL lets the decoder commit.
+  kl_weight: 1.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 0.0
+  optimizer_weight_decay: 5.0e-4
+
+  # LeRobot requires temporal_ensemble_coeff=null when n_action_steps>1.
+  # The whole point of n_action_steps=25 is to skip the smoothing that was
+  # blending active predictions toward zero, so this is the right pairing
+  # rather than a constraint we're working around.
+  temporal_ensemble_coeff: null
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: MEAN_STD
