@@ -1,0 +1,145 @@
+# ACT v5_cls — classification head, state-leak-stripped, clean baseline stats.
+#
+# Reframes the task from "regress a 6-D twist" to "predict one of 3 classes
+# per dim ({-0.1, 0, +0.1})".  This matches the actual data distribution
+# (audit_teleop_data.py: every action dim takes exactly 3 values, 0 deviation
+# from the 0.1 grid, ang.y is 99.9% zeros) and gives cross-entropy a shot at
+# producing a useful gradient on the 5-20% of frames that actually move.
+#
+# Headline numbers to beat on the val split (see scripts/baselines_ols.py):
+#
+#     baseline                         motion_acc   l1_phys
+#     zero/majority-class predictor        0.00      0.00649
+#     OLS(state, leak-stripped)           31.79      0.00930     <- honest floor
+#     OLS(state, leaky)                   80.78      0.00363     <- leak ceiling
+#     ACT v2 best (regression, leak)       ??        0.00360
+#
+# v5_cls targets: motion_accuracy > 0.55, l1_phys < 0.0050.  If it clears
+# those bars, we've genuinely learned vision-based manipulation.  If it's
+# only at ~0.40 / 0.007 we've at least got a proper metric and the right
+# loss family; grid-searching lr, aug, etc. will matter.
+#
+# Launch:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=1 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v5_cls.yaml
+
+run_name: v5_classification
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 15
+  cameras:
+    - observation.images.center_camera
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+  stats_train_only: true
+  trim_tail_fraction: 0.0
+
+training:
+  steps: 40_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+action_weighting:
+  enable: false   # incompatible with classification; would be ignored anyway
+
+# The classification head tends to hit peak val/motion_accuracy earlier than
+# regression hits peak val/l1 (per the Antigravity review's "overfitting at
+# step 20-25k" observation, which is partly a regression artifact).  Shorter
+# patience so we don't burn GPU on a plateau.
+early_stopping:
+  enable: true
+  patience_steps: 6_000
+  min_delta: 0.001        # measured in val/l1_phys (cross-entropy magnitude varies by run)
+  min_steps: 10_000
+
+evaluation:
+  eval_freq: 1_000
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v5", "v5_cls", "classification", "state-leak-fixed"]
+
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  # Keep the CVAE on for now -- the posterior/prior gap becomes a cleaner
+  # diagnostic signal under cross-entropy (classification loss doesn't have
+  # a regression-to-the-mean bias).
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
+
+  # v5_cls: discrete classification head per action dim.  Replaces ACT's
+  # regression head with 6 independent 3-way softmax heads + cross-entropy.
+  discrete_action:
+    enable: true
+
+  # Force IDENTITY normalization on ACTION so the class-snap receives raw
+  # physical values; the rest stays on ACT's stock MEAN_STD defaults.  Strings
+  # here get converted to NormalizationMode enum by build_act_config.
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: IDENTITY

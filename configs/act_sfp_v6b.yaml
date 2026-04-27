@@ -1,0 +1,193 @@
+# ACT v6b — rerun of v6 with the EarlyStopper delta-check bug fixed.
+#
+# The original v6 run (273e15d, outputs/act_sfp/v6_3cam_170_30) was cut
+# short at step 15000 when val/motion_accuracy was still climbing
+# (0.47 -> 0.50 -> 0.52 -> 0.52 over steps 12k..15k).  Root cause was
+# EarlyStopper.update() running the delta-improvement check against the
+# just-updated self.best instead of the prior best.  Fixed in 831740c.
+#
+# v6b is the same config with the fixed stopper.  Expected to run to
+# ~step 27000 before plateauing (last delta-improvement was at step
+# 15000 + patience 12000).
+#
+# All other settings identical to v6 so the only controlled variable
+# between v6 and v6b is the stopper fix.
+#
+# Original v6 header follows:
+# ---------------------------
+# ACT v6 — full 201-episode dataset, 3-camera, classification head.
+#
+# What's new over v5_cls
+# ----------------------
+# Data:
+#   * Dataset grew from ~127 -> 201 episodes (152,790 frames).  v6 uses a
+#     170 / 30 train/val split (up from 112 / 15 in v5), giving the policy
+#     +52% train frames and 2x the val frames so metric estimates are less
+#     noisy across the eval curve.
+#   * Three cameras (left + center + right).  v5_cls used center_camera only
+#     to isolate the state-leak fix; v6 adds the other two so ACT can
+#     actually use its multi-view advantage.
+#
+# Metrics:
+#   * v5's evaluate() averaged per-batch fractions ("mean-of-means"), which
+#     understated val/motion_accuracy by ~2x.  v6 pools numerator/denominator
+#     globally -- the true step-10000 number for v5_cls was 0.569, not 0.265.
+#   * Early stopping tracks val/motion_accuracy (maximize) instead of
+#     val/l1_loss (minimize).  v5_cls stopped at step 10000 when val/l1_loss
+#     plateaued, but motion_accuracy was still climbing.  The classification
+#     run's actual signal is motion_accuracy; stop on that.
+#
+# Baselines on the new 30-episode val split (see baselines_ols.py; seed=42):
+#     171 train / 30 val episodes = 22,566 val frames
+#
+#     zero-predictor                  motion_acc = 0.0000   l1_phys = 0.00681
+#     OLS-clean (14-D state)          motion_acc =   0.31   l1_phys = 0.00973   <- honest floor
+#     v5_cls step_000010000 (1-cam, 15-ep val)
+#                                     motion_acc =   0.57   l1_phys = 0.00421   <- prior best
+#     OLS-leaky  (26-D state)         motion_acc =   0.81   l1_phys = 0.00385   <- state-leak ceiling
+#
+# v6 targets on the 30-ep split:
+#   * motion_accuracy  >= 0.65 (15% absolute over v5_cls, +100% over OLS-clean)
+#   * l1_phys          <= 0.0040 (close the gap to OLS-leaky without leaking)
+#
+# Launch:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v6.yaml
+
+run_name: v6b_3cam_170_30
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 30
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  # Carry v5's state-leak fix forward.  tcp_velocity.* correlates with the
+  # target action up to 0.973; tcp_error.* encodes the integral of what the
+  # policy should do next.  Left in, they let a 157-param OLS match ACT's
+  # "best" val loss.  See docs/teleop_dataset_audit.md (v5 writeup).
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  # Normalizer stats from train-only split.
+  stats_train_only: true
+
+  # Boundary trimming is a distribution-shift confound; keep disabled.
+  trim_tail_fraction: 0.0
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  # 80k with +60% train data works out to roughly the same number of passes
+  # over the data as v5_cls's 40k.  The motion-accuracy early-stop will cut
+  # this short if the curve plateaus.
+  steps: 80_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+action_weighting:
+  enable: false   # incompatible with classification; ignored by DiscreteACTPolicy.
+
+# v6 headline change: stop on val/motion_accuracy (maximize).  v5_cls lost
+# ~3x of motion-accuracy headroom because val/l1_loss plateaued early while
+# motion_accuracy kept climbing.
+early_stopping:
+  enable: true
+  metric: val/motion_accuracy
+  mode: maximize
+  patience_steps: 12_000
+  min_delta: 0.005     # 0.5 motion-accuracy percentage points
+  min_steps: 15_000
+
+evaluation:
+  eval_freq: 1_000
+  eval_batches: null      # full val set every eval
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v6", "3cam", "201ep", "classification", "state-leak-fixed"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
+
+  # Same classification head as v5_cls.
+  discrete_action:
+    enable: true
+
+  normalization_mapping:
+    VISUAL: MEAN_STD
+    STATE: MEAN_STD
+    ENV: MEAN_STD
+    ACTION: IDENTITY

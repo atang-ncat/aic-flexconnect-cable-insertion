@@ -1,0 +1,186 @@
+# ACT (Action Chunking Transformer) training config for the SFP-insertion
+# teleop dataset.  v2 of our policy experiments.
+#
+# Dataset:     151 episodes, 119,144 frames @ 30 Hz (ur5e_aic)
+#              3 cameras (left / center / right), 256x288 native, av1
+#              observation.state: 26-d
+#              action:            6-d Cartesian twist
+#
+# Why ACT for v2 (post-mortem of VQ-BeT A/B run):
+#   1. VQ-BeT + RN50 (ImageNet AND R3M) both plateaued at val_action_mse_norm
+#      ~= 0.0186 by step ~15k and then overfit.  Choice of backbone made no
+#      meaningful difference: the information bottleneck was data/augmentation,
+#      not capacity.
+#   2. VQ-BeT's 0.4.3 config validator only accepts ONE camera per policy
+#      input (see configuration_vqbet.py:validate_features).  ACT supports
+#      arbitrary many ("observation.images.*"), so v2 gets the full left /
+#      center / right view for free.
+#   3. ACT's GPU was saturated (~100% util) in the baseline run versus VQ-BeT
+#      at ~5-10% util, so ACT converts more wall-clock into gradient updates.
+#
+# What's new in v2 vs the ACT baseline (ab_act_baseline, LeRobot CLI):
+#   * 3 cameras instead of 1  (+3x visual info per step)
+#   * in-loop ColorJitter + RandomErasing image augmentation (train only)
+#   * weight_decay bumped 1e-4 -> 5e-4 (was overfitting)
+#   * offline val every 1k steps, tracks val/action_mse_norm (baseline had none)
+#   * best-checkpoint symlink keyed on val/l1_loss (baseline kept only 'last')
+#   * 50k steps instead of 100k (baseline was flat by 20-30k)
+
+run_name: null                # auto-generated as act_sfp_<timestamp> when null
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp        # label only, nothing downloaded
+  video_backend: pyav              # ffmpeg 8 in pixi env, torchcodec needs 4-7
+  val_num_episodes: 15             # -> 136 train / 15 val, split with `seed`
+
+  # ACT natively supports multiple "observation.images.*" keys, so use all 3.
+  # For ablation just drop entries here; the policy features auto-adapt.
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 50_000
+  # batch_size: 32 with 3 cameras is ~96 resnet18 passes per step at 224x224.
+  # ResNet18 is ~4x cheaper than ResNet50, so memory pressure is comparable to
+  # VQ-BeT's batch=64 single-cam setup (which hit ~15 GB in phase 2).  We have
+  # 48 GB per GPU, so plenty of headroom; bump to 48 or 64 after smoke test if
+  # memory utilization is low.
+  batch_size: 32
+  num_workers: 16                  # plenty of CPU cores; pyav is the bottleneck
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Image augmentation (applied train-only, before normalization)
+# ---------------------------------------------------------------------------
+# Rationale:
+#   The teleop dataset has ~119k frames from 151 episodes of a single SFP
+#   insertion task.  The workspace, lighting, and camera extrinsics are
+#   essentially fixed across episodes, so the policy can easily memorize
+#   view-specific cues rather than the insertion geometry.  Mild photometric
+#   jitter plus RandomErasing simulates shadow / occlusion / exposure drift
+#   at runtime without touching object geometry.  These are the same magnitude
+#   of perturbations the original ACT paper uses on Aloha.
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8                         # per-batch probability of applying
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0                     # fill with black (in [0,1] image space)
+
+# ---------------------------------------------------------------------------
+# Action-weighted L1 loss  (v3 intervention; see act_sfp_v3.yaml to enable)
+# ---------------------------------------------------------------------------
+# Motivation (see scripts/audit_teleop_data.py output):
+#   ~60% of dataset frames are "idle" (||action||2 < 0.01), and the last 10%
+#   of each episode is ~95% idle (post-roll stillness).  Under unweighted L1,
+#   the model is rewarded for predicting zeros most of the time; that's how
+#   v1/v2 got a good-looking train loss and weak insertion behavior.
+# Fix:
+#   per-step weight = clip(||target_action||2 / scale, [floor, ceil]).
+#   Motion frames get weight ~1.0; idle frames get weight floor (=0.1 means
+#   they contribute 10x less than motion frames).
+# Enable in act_sfp_v3.yaml rather than here, so that v2 ablations stay
+# bit-identical to stock LeRobot ACT.
+action_weighting:
+  enable: false
+  scale: 0.03                      # ref action norm; motion >= scale -> weight=1
+  floor: 0.1                       # min weight for pure-idle targets
+  ceil: 1.0                        # max weight (cap for action norms above scale)
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 1_000                 # every N optimizer steps (0 disables)
+  eval_batches: 50                 # val batches per eval pass
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3       # plus a best-val symlink
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v2", "multi-cam", "aug"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters (passed as kwargs to ACTConfig)
+# ---------------------------------------------------------------------------
+policy:
+  # Observation / action windows
+  # ACT forcibly requires n_obs_steps=1 (validated in __post_init__).
+  # chunk_size=100 at 30 Hz = 3.33s of predicted action; n_action_steps=100
+  # means the queue is refilled once per chunk, cheap inference.
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  # Vision backbone
+  #   ResNet18 + ImageNet matches the ACT paper and was the strongest of our
+  #   three v1 runs.  Keeping it lets us isolate the effect of the
+  #   augmentation / multi-cam changes from the backbone choice.
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  # Transformer
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1              # original paper's 7 was a bug; LeRobot uses 1
+
+  # VAE head (CVAE regularizer; encourages smooth latent over action chunks)
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  # Regularization
+  # dropout: 0.1 is the ACT default; bumping higher (0.2) tends to hurt
+  # convergence on small datasets, so we rely on weight-decay + aug instead.
+  dropout: 0.1
+
+  # Optimizer (ACT has no scheduler preset; constant LR through training).
+  # weight_decay: 5e-4 is 5x the LeRobot default to combat overfitting we
+  # observed in the v1 runs.  If val loss regresses after a few k steps,
+  # try reverting to 1e-4.
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  # Inference-time temporal ensembling off for training-only speed; can be
+  # enabled at deploy time by setting n_action_steps=1 + temporal_ensemble_coeff=0.01.
+  temporal_ensemble_coeff: null
+
+  # Not pushing to HF Hub from the training loop
+  push_to_hub: false
+  repo_id: null

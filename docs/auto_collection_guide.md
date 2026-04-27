@@ -1,5 +1,37 @@
 # Automated Demo Collection Guide
 
+> [!IMPORTANT]
+> **2026-04-24 update — script has been significantly fixed.** New flags and behavior:
+>
+> - `--plug-type sfp|sc` selects per-plug frames, task string, and controller gains. Replaces the hardcoded SFP-only behavior.
+> - `--dry-run` runs one episode without writing a dataset — always do this before a long session. It catches F/T/TF/camera setup problems in 30 seconds.
+> - Dataset schema is now **32-D state with tared F/T wrench** (force xyz + torque xyz), matching the post-fix teleop driver. Auto-collected and teleop datasets can be trained on together.
+> - Control loop uses **sim time** (`create_rate` + `rate.sleep`) instead of wall-clock `time.sleep`, so the frame rate stays locked to `--fps` regardless of Gazebo speed.
+> - Image decoding is **encoding-aware** (handles rgb8/bgr8/rgba8/bgra8 via `msg.encoding`) instead of assuming naked bytes.
+> - TF failures mid-episode now **hold last action** rather than recording a zero-velocity frame.
+> - Camera stalls mid-episode now **drop the frame** rather than recording black pixels.
+>
+> **Quick-start commands** (inside the `aic_eval` distrobox, copy each line as ONE line — don't use backslash continuations when pasting into the terminal, some paste tools insert trailing whitespace that breaks them):
+>
+> ```bash
+> # 0. Start Gazebo (Terminal 1, single line):
+> ros2 launch aic_bringup aic_gz_bringup.launch.py ground_truth:=true start_aic_engine:=false spawn_task_board:=true spawn_cable:=true attach_cable_to_gripper:=true cable_type:=sfp_sc_cable nic_card_mount_0_present:=true nic_card_mount_0_translation:=0.005 sc_port_0_present:=true sc_port_0_translation:=-0.04
+>
+> # 1. Always dry-run first (Terminal 2, single line):
+> cd /run/host/scratch2/atang/ws_aic/src/aic && pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py --plug-type sfp --dry-run
+>
+> # 2. Real collection (Terminal 2, single line; fresh --dataset-root
+> #    with the -ft suffix to keep the 32-D schema separate from the
+> #    legacy 26-D datasets):
+> cd /run/host/scratch2/atang/ws_aic/src/aic && pixi run python3 /run/host/scratch2/atang/ws_aic/scripts/auto_collect.py --plug-type sfp --dataset-root /run/host/scratch2/atang/ws_aic/teleop-automated-dataset-ft/sfp --num-episodes 30 --max-attempts 60
+> ```
+>
+> **Path note:** inside the distrobox, the host's `/scratch2/...` is mounted at `/run/host/scratch2/...`. Always prefer the `/run/host/` path when the command is running inside the container.
+>
+> **Do NOT resume old 26-D auto-collected datasets** (`teleop-automated-dataset/sfp/` etc.) with the new script. Fresh path. See `critical_issues.md` for the full schema story.
+>
+> See `PLUG_PROFILES` at the top of `scripts/auto_collect.py` for the controller gain knobs to tune if success rate is low.
+
 ## What This Is
 
 `scripts/auto_collect.py` is an automated data collection script that generates LeRobot-compatible training demos **without a human operator**. It replicates the targeting logic from CheatCode (the ground-truth expert policy) but outputs velocity commands — the same action format that `lerobot-record` produces during manual teleoperation.

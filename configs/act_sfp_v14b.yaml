@@ -1,0 +1,150 @@
+# ACT v14b — v13 action weighting + low KL
+#
+# v13b tested low KL (1.0) with weak weighting → collapsed (3.0).
+# But we never tested low KL with STRONG weighting.
+# v14b = v13's proven weighting (scale=0.02, floor=0.05) + kl_weight=1.0
+# If KL helps independently of weighting, this should beat v13's 68.02.
+#
+# Launch:
+#   ./scripts/launch_train_act_v14.sh  (uses GPU 1)
+
+run_name: v14b_strong_weight_low_kl
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset (same as v13)
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset-ft-v1
+  repo_id: local/teleop_sfp_ft
+  video_backend: pyav
+  val_num_episodes: 15
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+  trim_head_fraction: 0.10
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 15_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+lr_schedule:
+  enable: true
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# v14b: same proven action weighting as v13 (~20x)
+action_weighting:
+  enable: true
+  scale: 0.02
+  floor: 0.05
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 3_000
+  min_delta: 0.0002
+  min_steps: 3_000
+
+evaluation:
+  eval_freq: 500
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 2_500
+  keep_last_n_checkpoints: 5
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v14b", "3cam", "ft-sensor", "joint-velocities",
+         "ema-smoothed", "ft-v1", "27d-state", "115ep",
+         "cosine-lr", "frozen-backbone",
+         "20x-action-weight", "low-kl", "head-trim"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 1
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  # v14b KEY CHANGE: lower KL weight (10 → 1) — lets CVAE commit harder
+  kl_weight: 1.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 0.0
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: 0.01
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MEAN_STD
+    ACTION: MEAN_STD

@@ -1,0 +1,166 @@
+# ACT v4 training config for the SFP-insertion teleop dataset.
+#
+# v4 = v3 base + early stopping + boundary-trim knob + milder weighting default.
+#
+# What this file is (the COMMON ground across the three v4 ablation cells):
+#   * Smoothed dataset (Sav-Gol) -- v3 showed smoothing is neutral on val/l1
+#     but slightly better on val/action_mse and should give smoother rollouts
+#     on hardware.
+#   * 1-camera (center) baseline, ImageNet ResNet-18, aug ON.
+#   * Unweighted L1 loss (action_weighting.enable=false) -- v3 showed that
+#     aggressive floor=0.1 weighting hurt val/l1 by shrinking the effective
+#     training set; we default OFF here and let one variant turn it on at a
+#     MILDER floor=0.5.
+#   * No boundary trimming by default; one variant turns it on.
+#   * Early stopping ENABLED with 5k patience after 12k warmup.
+#
+# The three ablation cells override exactly ONE variable each (see
+# scripts/run_act_v4_ablations.sh):
+#   1) v4_multicam_smooth : dataset.cameras -> all 3 cameras.
+#   2) v4_boundary_trim   : dataset.trim_tail_fraction -> 0.10.
+#   3) v4_mild_weight     : action_weighting.{enable=true, floor=0.5}.
+#
+# Launch a single variant manually, e.g.:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v4.yaml \
+#     --set run_name=act_v4_smoke training.steps=200 wandb.enable=false
+
+run_name: null                      # auto act_sfp_<timestamp> when null
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  # Sav-Gol-smoothed data (see scripts/smooth_actions.py).  v3 showed smoothing
+  # is neutral-to-slightly-better on the offline metric and should produce
+  # smoother hardware rollouts than the step-function raw teleop actions.
+  root: teleop-dataset-smoothed
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 15
+  # v2 ablation: center_camera alone matched / beat multicam at every checkpoint.
+  # v4 keeps this as the default (two of three cells use it); the multicam cell
+  # overrides to all three cameras to re-test that finding on smoothed data.
+  cameras:
+    - observation.images.center_camera
+  # v4 new knob.  When > 0, drop the last ``trim_tail_fraction`` of frames of
+  # each episode from the TRAIN set (val stays untouched).  Audit showed ~60%
+  # of frames are near-idle, most clustered in the post-insertion tail.
+  # Default 0.0 = no trim (matches v3 behavior).
+  trim_tail_fraction: 0.0
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  # 40k is an upper bound; early stopping will usually cut runs between 20k
+  # and 30k based on v2/v3 plateau behavior.
+  steps: 40_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# ---------------------------------------------------------------------------
+# Image augmentation (GPU-side -- see train_act.py ImageAugmenter docstring)
+# ---------------------------------------------------------------------------
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# ---------------------------------------------------------------------------
+# Action-weighted L1 loss
+# ---------------------------------------------------------------------------
+# v3 result: floor=0.1 (a 10x penalty on idle frames) HURT val/l1 by shrinking
+# the effective training set and amplifying overfitting.  v4 default = OFF.
+# The v4_mild_weight cell flips enable=true with floor=0.5 (2x penalty) as a
+# gentler re-test.
+action_weighting:
+  enable: false
+  scale: 0.03
+  floor: 0.5
+  ceil: 1.0
+
+# ---------------------------------------------------------------------------
+# Early stopping  (v4 new)
+# ---------------------------------------------------------------------------
+# Stop after ``patience_steps`` of no absolute improvement (>= min_delta) in
+# val/l1_loss, but only once ``min_steps`` has passed (so we don't cut warmup).
+# With eval_freq=1000 below, patience=5000 means "5 consecutive evals without
+# a new best".
+early_stopping:
+  enable: true
+  patience_steps: 5_000
+  min_delta: 0.0005
+  min_steps: 12_000
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 1_000
+  eval_batches: 50
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v4", "smoothed", "early-stop"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters  (unchanged from v2/v3)
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null

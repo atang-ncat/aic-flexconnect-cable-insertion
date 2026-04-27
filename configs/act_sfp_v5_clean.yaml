@@ -1,0 +1,178 @@
+# ACT v5_clean — the "honest baseline" config.
+#
+# Why this exists
+# ---------------
+# Every v2-v4 run was unknowingly competing with a 157-parameter linear
+# regression from state alone (scripts/baselines_ols.py with the FULL 26-D
+# state as input):
+#
+#     OLS-full    val l1_phys = 0.003629   motion_acc = 80.78%
+#     ACT v2 best val l1_phys = 0.003603   (unknown motion_acc)
+#
+# ACT was beating OLS by 0.7%, well inside seed variance.  The cameras,
+# transformer, backbone, CVAE, 32M parameters -- all of it was decorative,
+# because the policy could read the next action directly off the
+# ``tcp_velocity`` and ``tcp_error`` state channels (corr up to +0.973 with
+# the target action).
+#
+# v5_clean strips those leaky channels.  The relevant target is now
+#
+#     OLS-clean   val l1_phys = 0.009297   motion_acc = 31.79%
+#
+# Any ACT run trained with this config must beat BOTH of those numbers to
+# have meaningfully learned visuomotor control.  Targets:
+#
+#   * l1_phys < 0.0050 on RAW physical units (>45% improvement over clean OLS)
+#   * motion_accuracy > 0.55 (>70% relative improvement)
+#
+# If we can't clear those bars, we know the problem isn't "pick a better
+# backbone" -- the dataset doesn't have the information content to learn
+# vision-based manipulation with this pipeline, and we need to rethink the
+# data collection (more episodes, more visual variety, or a simulator).
+#
+# Other v5 fixes bundled in:
+#   * ``stats_train_only: true``           -- normalizer stats computed on
+#                                             train episodes only (closes a
+#                                             mild val-stats leak).
+#   * ``eval_batches: null``               -- every eval runs the FULL val
+#                                             set (~12k frames), so numbers
+#                                             don't depend on dataloader
+#                                             shuffle order.
+#   * unweighted loss denominator fix      -- ``train/l1_loss`` gradient
+#                                             now divides by valid count,
+#                                             same denom as the logged
+#                                             metric and val metric.
+#
+# Launch:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v5_clean.yaml
+
+run_name: v5_clean_baseline
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset
+  repo_id: local/teleop_sfp
+  video_backend: pyav
+  val_num_episodes: 15
+  cameras:
+    - observation.images.center_camera
+
+  # v5 headline fix: drop the state channels that leak the action.
+  # tcp_velocity.* correlates with the target action up to 0.973; tcp_error.*
+  # encodes the integral of what the policy should do next.  Left in, they
+  # let a 157-param OLS match ACT's "best" val loss.
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  # Close the mild val-stats leak in the normalizer.
+  stats_train_only: true
+
+  # v4 boundary trimming is a distribution-shift confound; leave disabled.
+  trim_tail_fraction: 0.0
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 40_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+# Moderate augmentation -- matches the v2-multicam-aug winner.
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# No action weighting in the clean baseline.  Weighted v3 ran into the
+# "amplified overfitting under reduced effective dataset" failure mode --
+# keep it off until we have a proper loss to weight (classification head).
+action_weighting:
+  enable: false
+
+# Early stopping with more patience than v4 (v5 has less CVAE posterior noise
+# in the val signal after the loss-denom fix).
+early_stopping:
+  enable: true
+  patience_steps: 8_000
+  min_delta: 0.0005
+  min_steps: 12_000
+
+# ---------------------------------------------------------------------------
+# Evaluation, logging, checkpointing
+# ---------------------------------------------------------------------------
+evaluation:
+  eval_freq: 1_000
+  eval_batches: null   # v5: run the FULL val set every eval.
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 5_000
+  keep_last_n_checkpoints: 3
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "teleop-only", "v5", "v5_clean", "state-leak-fixed"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 100
+  n_action_steps: 100
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 512
+  n_heads: 8
+  dim_feedforward: 3200
+  feedforward_activation: relu
+  n_encoder_layers: 4
+  n_decoder_layers: 1
+
+  # v5: keep CVAE on for the regression baseline; comparing vs. v5_cls will
+  # tell us whether the CVAE+posterior-vs-prior confound actually matters.
+  # Set use_vae=false if we want an additional knob to pull.
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 1.0e-5
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: null
+  push_to_hub: false
+  repo_id: null
