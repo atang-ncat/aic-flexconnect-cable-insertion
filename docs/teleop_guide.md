@@ -81,7 +81,139 @@ Shows a live dashboard with the tared force magnitude, a color-coded bar, and cu
 
 ---
 
-## 2. Keyboard Controls — Complete Reference
+## 1b. Recording with a PS5 DualSense / Xbox / Logitech F710 gamepad — STRONGLY PREFERRED
+
+The keyboard teleop emits a step-function on every axis (a key is either held or released, never partially), which after EMA smoothing produces the bimodal action distribution that limited every policy trained from `teleop-dataset-ft-v1`. A dual-stick gamepad has six fully spring-centered, proportional analog axes (4 stick + 2 trigger) — exactly the right shape for our 6-DOF Cartesian twist action space. The recorded action distribution comes out unimodal and continuous without any post-processing, which is what L1-regression policies like ACT need to emit high-magnitude motions during inference.
+
+The teleop class lives at `src/aic/aic_utils/lerobot_robot_aic/lerobot_robot_aic/aic_teleop.py` (`AICGamepadEETeleop`, registered as `aic_gamepad_ee`). It is driven by pygame/SDL2 so it accepts any standard gamepad: PS5 DualSense, Xbox Wireless Controller, Logitech F710 (XInput mode), or anything else SDL2 recognizes.
+
+### Recording command
+
+Identical to the keyboard recipe in §1, but swap the `--teleop.type` argument:
+
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic/
+pixi run lerobot-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_gamepad_ee --teleop.id=aic \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --dataset.repo_id=atang/aic_sfp_demos_gamepad \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/teleop-dataset-gamepad/sfp \
+  --dataset.single_task="Insert SFP connector into SFP port on NIC card" \
+  --dataset.push_to_hub=false \
+  --dataset.private=true \
+  --play_sounds=false \
+  --display_data=true
+```
+
+> **First time only:** omit `--resume=true` (it isn't shown above for that reason); add it on every subsequent session against the same `dataset.root`.
+>
+> Use a fresh `dataset.root` like `teleop-dataset-gamepad/sfp` rather than appending to the keyboard dataset. The action statistics will be different (continuous vs. bimodal), and mixing them defeats the whole point of switching input devices. Once we've validated gamepad-only recordings, we can decide whether to merge.
+
+### Gamepad button & axis map
+
+| Gamepad input | Robot DOF | Sign convention |
+|--|--|--|
+| Left stick X (push right) | `linear.x` | + |
+| Left stick Y (push forward) | `linear.y` | + |
+| Right trigger (R2/RT) | `linear.z` | + (up, away from table) |
+| Left trigger (L2/LT) | `linear.z` | − (down, into the port) |
+| Right stick Y (push forward) | `angular.x` (pitch forward) | + |
+| Right stick X (push right) | `angular.y` (roll right) | + |
+| R1 / RB (right bumper) | `angular.z` (CCW yaw) | + |
+| L1 / LB (left bumper) | `angular.z` (CW yaw) | − |
+
+These match the keyboard axes in §2 exactly, so muscle memory transfers between sessions if you alternate.
+
+### Recording-flow buttons
+
+The class synthesizes the same keyboard events that `lerobot-record`'s built-in listener already watches for, so you never have to take a hand off the gamepad:
+
+| Gamepad button | Effect | Equivalent key |
+|--|--|--|
+| **Triangle / Y** | Save current episode + start the next | Right Arrow |
+| **Square / X** | Discard current episode (rerecord) | Left Arrow |
+| **Cross / A** | Stop recording entirely | ESC |
+| **Options / Start** | Toggle slow ↔ fast scaling | (no keyboard equivalent; mirrors `t` in keyboard EE) |
+
+Buttons are edge-triggered, so holding one does not re-fire the event — a single Triangle press saves exactly one episode.
+
+### Speed modes
+
+Identical to the keyboard recipe: fast = 0.1 m/s and rad/s at full deflection, slow = 0.02 m/s and rad/s. Press **Options** to toggle. You'll get a console line confirming the change. Always switch to slow mode before fine alignment, exactly like §4 of this guide.
+
+### Stick / trigger response shaping
+
+Two knobs on `AICGamepadEETeleopConfig` control how analog input maps to velocity:
+
+- `stick_deadzone` (default 0.05) — values below this are clamped to 0. Raise this to 0.08-0.10 if your sticks have developed drift (common on aging F710s).
+- `stick_expo` (default 1.5) — exponent applied to the post-deadzone value. `>1` gives more fine control near center while preserving full-deflection top speed; this is what lets you make sub-millimeter corrections during SC alignment without sacrificing approach speed. Set to 1.0 to disable.
+- `trigger_deadzone` / `trigger_expo` — same idea but for L2/R2; trigger expo defaults to 1.3 because the descent axis benefits from finer control near zero (gentle initial contact) more than it does from a hard nonlinearity.
+
+You almost never need to override these. If you do, pass them on the command line:
+```bash
+--teleop.stick_expo=1.8 --teleop.trigger_expo=1.5
+```
+
+### Verifying the device before a long session
+
+Before committing to a 50-episode collection, sanity-check the controller:
+
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic
+pixi run python -c "
+import time, lerobot_robot_aic
+from lerobot.teleoperators import TeleoperatorConfig
+from lerobot.teleoperators.utils import make_teleoperator_from_config
+cfg = TeleoperatorConfig.get_choice_class('aic_gamepad_ee')(id='test', inject_keyboard_events=False)
+tel = make_teleoperator_from_config(cfg)
+tel.connect()
+print('Move sticks/triggers; values should print non-zero. Ctrl+C to stop.')
+try:
+    while True:
+        a = tel.get_action()
+        print({k: round(v, 4) for k, v in a.items()}, end='\r')
+        time.sleep(1/30)
+except KeyboardInterrupt:
+    pass
+tel.disconnect()
+"
+```
+
+If the printed dict stays exactly `{linear.x: 0.0, ...}` while you push the sticks, the controller isn't being read — check `lsusb` for the controller, and check that your terminal has permission to access `/dev/input/js0` (group `input` membership; `sudo usermod -aG input $USER` and re-login if needed).
+
+### If the buttons feel mapped to the wrong physical inputs
+
+SDL2 assigns button indices based on which kernel driver claimed the controller, not on the controller hardware. There are two common 13-button layouts in the wild for the DualSense: the modern `hid-playstation` layout and the SDL2 generic-HID "DS4-style" layout, and they relabel almost everything except the Triangle face button. The defaults in `AICGamepadEETeleopConfig` use the DS4-style layout because that's what we observed live on this rig and what Logitech F710 / Xbox in XInput mode also produces — so a single config covers all three controllers.
+
+If you plug in a different controller and one of the bindings feels wrong (e.g., the speed toggle fires when you press a trigger), run the probe to find the right index:
+
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic
+pixi run python /run/host/scratch2/atang/ws_aic/scripts/probe_gamepad_buttons.py
+```
+
+It prints `BUTTON DOWN index=N` every time you press something. Press the physical button you want, note `N`, then override the relevant field on the next `lerobot-record` invocation:
+
+```bash
+--teleop.speed_toggle_button=N --teleop.save_button=M ...
+```
+
+You can override `save_button`, `discard_button`, `stop_button`, `speed_toggle_button`, `yaw_pos_button`, `yaw_neg_button` independently. Set any of them to `-1` to disable that binding entirely.
+
+### Why this is preferred over the keyboard
+
+Concretely, the action distribution from a gamepad-recorded session should look like:
+
+- Per axis, ~30-50% of frames in the smooth mid-band (vs. ~5-12% for keyboard)
+- ~10-30% of frames at exact zero (vs. ~70-80% for keyboard) — operators tend to keep some stick deflection during all of approach/alignment/descent
+- ~0-5% of frames pegged at the velocity rails (vs. ~10-20% for keyboard) — full stick deflection is uncommon in normal teleop
+
+Run `scripts/probe_action_discreteness.py` against the new dataset and these are the numbers to look for. If you see them, the input-device fix is confirmed and a fresh policy training run on this data should do meaningfully better at insertion than v13.
+
+---
+
+## 2. Keyboard Controls — Complete Reference (legacy / fallback)
 
 ### Linear Movement (translation)
 
