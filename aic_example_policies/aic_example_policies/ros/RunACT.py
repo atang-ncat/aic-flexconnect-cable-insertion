@@ -60,11 +60,12 @@ class RunACT(Policy):
         # -------------------------------------------------------------------------
         # 1. Configuration & Weights Loading
         # -------------------------------------------------------------------------
-        # v10_ft continuous ACT (27-D state: pose + joints + joint_vel + tared wrench).
+        # v12: frozen backbone + cosine LR + v10-level regularization.
+        # best val/l1=0.244 @ step 3500. weight_norm=1.296 (vs v11c's 0.722).
         # Override with env AIC_ACT_POLICY_PATH=/path/to/checkpoints/best
         _default_ckpt = (
             "/scratch2/atang/ws_aic/outputs/act_sfp/"
-            "v10_ft_v1_115ep_baseline_20260425_195441/checkpoints/best"
+            "v12_cosine_lr_frozen_bb_20260426_172303/checkpoints/best"
         )
         policy_path = Path(os.environ.get("AIC_ACT_POLICY_PATH", _default_ckpt))
         # If running inside the docker container, /scratch2 is mapped to /run/host/scratch2
