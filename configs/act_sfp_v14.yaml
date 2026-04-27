@@ -1,0 +1,164 @@
+# ACT v14 — stronger action weighting (~40x) to push past 0.06m
+#
+# v13 scored 68.02 (best). The ONLY lever that moved scores was
+# action_weighting (scale=0.02, floor=0.05 → ~20x upweighting).
+# v13b (low KL, weak weighting) and v13c (no VAE, weak weighting)
+# both collapsed to 3.0.
+#
+# v14 doubles down: scale=0.015, floor=0.025 → ~40x upweighting.
+# This forces the loss to almost entirely care about moving frames.
+# Risk: if too aggressive, the model may overfit to movement frames
+# and produce jittery/unstable trajectories. We'll find out.
+#
+# v13 results:
+#   trial_1: 27.33  (final dist 0.09m)
+#   trial_2: 39.69  (final dist 0.06m)  ← first time inside bounding radius!
+#   total : 68.02
+#
+# Launch:
+#   ./scripts/launch_train_act_v14.sh
+#
+#   Manual:
+#   cd /scratch2/atang/ws_aic/src/aic && CUDA_VISIBLE_DEVICES=0 \
+#     pixi run python /scratch2/atang/ws_aic/scripts/train_act.py \
+#     --config /scratch2/atang/ws_aic/configs/act_sfp_v14.yaml
+
+run_name: v14_stronger_weighting
+seed: 42
+output_dir: outputs/act_sfp
+device: cuda
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+dataset:
+  root: teleop-dataset-ft-v1
+  repo_id: local/teleop_sfp_ft
+  video_backend: pyav
+  val_num_episodes: 15
+
+  cameras:
+    - observation.images.left_camera
+    - observation.images.center_camera
+    - observation.images.right_camera
+
+  state_drop_prefixes:
+    - tcp_velocity.
+    - tcp_error.
+
+  stats_train_only: true
+  trim_tail_fraction: 0.05
+  trim_head_fraction: 0.10
+
+  previous_action:
+    enable: false
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+training:
+  steps: 15_000
+  batch_size: 32
+  num_workers: 16
+  prefetch_factor: 4
+  pin_memory: true
+  grad_clip_norm: 10.0
+  use_amp: true
+  amp_dtype: bfloat16
+
+lr_schedule:
+  enable: true
+  warmup_steps: 500
+  min_lr_ratio: 0.01
+
+augmentation:
+  enable: true
+  color_jitter:
+    brightness: 0.3
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.05
+    p: 0.8
+  random_erasing:
+    p: 0.25
+    scale: [0.02, 0.10]
+    ratio: [0.3, 3.3]
+    value: 0.0
+
+# v14 KEY CHANGE: ~40x upweighting of active frames (v13 was ~20x)
+action_weighting:
+  enable: true
+  scale: 0.015      # was 0.02 in v13 → even sharper weighting
+  floor: 0.025      # was 0.05 in v13 → idle frames get 40x less weight
+  ceil: 1.0
+
+early_stopping:
+  enable: true
+  metric: val/l1_loss
+  mode: minimize
+  patience_steps: 3_000
+  min_delta: 0.0002
+  min_steps: 3_000
+
+evaluation:
+  eval_freq: 500
+  eval_batches: null
+  eval_batch_size: 32
+
+logging:
+  log_freq: 100
+  save_freq: 2_500
+  keep_last_n_checkpoints: 5
+
+wandb:
+  enable: true
+  project: act_sfp
+  entity: null
+  tags: ["act", "sfp", "v14", "3cam", "ft-sensor", "joint-velocities",
+         "ema-smoothed", "ft-v1", "27d-state", "115ep",
+         "cosine-lr", "frozen-backbone",
+         "40x-action-weight", "head-trim"]
+
+# ---------------------------------------------------------------------------
+# ACT policy hyperparameters (same as v13)
+# ---------------------------------------------------------------------------
+policy:
+  n_obs_steps: 1
+  chunk_size: 50
+  n_action_steps: 1
+
+  vision_backbone: resnet18
+  pretrained_backbone_weights: "ResNet18_Weights.IMAGENET1K_V1"
+  replace_final_stride_with_dilation: false
+
+  pre_norm: false
+  dim_model: 256
+  n_heads: 8
+  dim_feedforward: 1024
+  feedforward_activation: relu
+  n_encoder_layers: 2
+  n_decoder_layers: 1
+
+  use_vae: true
+  latent_dim: 32
+  n_vae_encoder_layers: 4
+  kl_weight: 10.0
+
+  dropout: 0.1
+
+  optimizer_lr: 1.0e-5
+  optimizer_lr_backbone: 0.0
+  optimizer_weight_decay: 5.0e-4
+
+  temporal_ensemble_coeff: 0.01
+
+  push_to_hub: false
+  repo_id: null
+
+  discrete_action:
+    enable: false
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: MEAN_STD
+    ACTION: MEAN_STD
