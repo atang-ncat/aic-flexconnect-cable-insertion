@@ -1,0 +1,24 @@
+# Gamepad v2 dataset layout (reference)
+#
+# This file is documentation for humans and future automation.  train_act.py
+# does not load it — use ``configs/act_sfp_v18.yaml`` (or similar) with
+# ``dataset.root: datasets/teleop-dataset-combined-v2`` after running
+# ``scripts/build_combined_v2.py``.
+
+gamepad_v2:
+  sfp_root: datasets/teleop-dataset-gamepad-v2/sfp
+  sc_root: datasets/teleop-dataset-gamepad-v2/sc
+  single_task:
+    sfp: "Insert SFP connector into SFP port on NIC card"
+    sc: "Insert SC connector into SC port"
+
+combined_training:
+  root: datasets/teleop-dataset-combined-v2
+  act_config: configs/act_sfp_v18.yaml
+
+recording:
+  script_sfp: scripts/record_gamepad_v2_sfp.sh
+  script_sc: scripts/record_gamepad_v2_sc.sh
+  doc: docs/gamepad_v2_recording.md
+  sc_scene_configs: docs/sc_scene_configs.md
+  sfp_scene_configs: docs/sfp_scene_configs.md

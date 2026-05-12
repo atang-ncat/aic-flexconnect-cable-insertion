@@ -5,6 +5,10 @@
 
 ---
 
+For **SC plug → SC port** launch grids (reversed cable, `sc_port_*`, rails), see **[`sc_scene_configs.md`](sc_scene_configs.md)**.
+
+---
+
 ## What Varies During Evaluation (and therefore in our data)
 
 Based on `qualification_phase.md` and `sample_config.yaml`, the eval randomizes:
@@ -43,6 +47,13 @@ ros2 launch aic_bringup aic_gz_bringup.launch.py \
 ```
 
 ### Terminal 2 — Record episodes
+
+**Gamepad v2 (recommended for current SFP collection):** use
+[`scripts/record_gamepad_v2_sfp.sh`](../scripts/record_gamepad_v2_sfp.sh) and
+[`docs/gamepad_v2_recording.md`](gamepad_v2_recording.md).  
+**SC gamepad v2:** [`scripts/record_gamepad_v2_sc.sh`](../scripts/record_gamepad_v2_sc.sh) with the SC Gazebo launch from [`teleop_guide.md`](teleop_guide.md) §1.
+
+Keyboard / legacy path:
 
 ```bash
 cd /run/host/scratch2/atang/ws_aic/src/aic/
