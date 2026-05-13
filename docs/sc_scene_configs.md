@@ -29,12 +29,32 @@ Pick a block from [Full Copy-Paste Launch Commands](#full-copy-paste-launch-comm
 
 ### Terminal 2 — record (gamepad v2, SC dataset root)
 
+**Helper script (recommended):**
+
 ```bash
 bash /run/host/scratch2/atang/ws_aic/scripts/record_gamepad_v2_sc.sh --resume=true
 ```
 
-First session on an empty root: run the same script **without** `--resume=true` once.  
-Full paths and one-liner: [`gamepad_v2_recording.md`](gamepad_v2_recording.md).
+**Full `pixi` one-liner (when you want to override flags or aren't using the helper):**
+
+```bash
+cd /run/host/scratch2/atang/ws_aic/src/aic && pixi run lerobot-record \
+  --robot.type=aic_controller --robot.id=aic \
+  --teleop.type=aic_gamepad_ee --teleop.id=aic \
+  --teleop.stick_deadzone=0.02 --teleop.stick_expo=1.0 \
+  --teleop.trigger_deadzone=0.01 --teleop.trigger_expo=1.0 \
+  --teleop.low_command_scaling=0.04 \
+  --robot.teleop_target_mode=cartesian --robot.teleop_frame_id=base_link \
+  --dataset.repo_id=atang/aic_sc_demos_gamepad_v2 \
+  --dataset.root=/run/host/scratch2/atang/ws_aic/datasets/teleop-dataset-gamepad-v2/sc \
+  --dataset.single_task="Insert SC connector into SC port" \
+  --dataset.push_to_hub=false --dataset.private=true \
+  --play_sounds=false --display_data=true --resume=true
+```
+
+> **First session on an empty root:** omit `--resume=true` once so LeRobot can create the dataset; every session after, keep it on.
+
+See also: [`gamepad_v2_recording.md`](gamepad_v2_recording.md) for the dataset-root convention and the SFP equivalent.
 
 ### Terminal 3 (optional)
 
